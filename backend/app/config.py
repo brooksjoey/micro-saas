@@ -1,192 +1,236 @@
+# backend/app/config.py
+
 from __future__ import annotations
 
 import os
-import threading
-from typing import Any, Dict, Optional
+from functools import lru_cache
+from typing import Any, Optional
 
-from pydantic import BaseModel, Field, ValidationError
-
-
-_ENV_LOCK = threading.Lock()
-_SETTINGS: "Settings | None" = None
+from pydantic import Field, PostgresDsn, validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-def _read_bool(value: str | None, default: bool) -> bool:
-    if value is None:
-        return default
-    value = value.strip().lower()
-    if value in {"1", "true", "yes", "y", "on"}:
-        return True
-    if value in {"0", "false", "no", "n", "off"}:
-        return False
-    return default
+class Settings(BaseSettings):
+    """
+    Global application configuration.
 
+    Canonical environment variables are:
 
-class Settings(BaseModel):
-    """Application configuration loaded from environment variables.
+    Core:
+      - APP_ENV                     -> "local" | "dev" | "staging" | "prod"
+      - SERVICE_NAME                -> "api" | "worker-generic" | "worker-browser" | "billing-cron" | "agents"
+      - LOG_LEVEL                   -> "DEBUG" | "INFO" | "WARNING" | "ERROR"
 
-    Environment precedence is:
+    Database:
+      - POSTGRES_DSN                -> postgresql+asyncpg://USER:PASS@HOST:PORT/DB_NAME
+      - DB_POOL_SIZE                -> int, default 10
+      - DB_MAX_OVERFLOW             -> int, default 20
+      - DB_POOL_TIMEOUT             -> float seconds, default 30.0
+      - DATABASE_URL                -> legacy alias for POSTGRES_DSN (optional)
 
-    1. Canonical env var names (e.g. POSTGRES_DSN, APP_ENV).
-    2. Legacy aliases (e.g. DATABASE_URL, ENV) when canonical is unset.
-    3. Built-in defaults where defined.
+    Redis:
+      - REDIS_URL                   -> redis://...
+      - MSAAS_REDIS_PREFIX          -> key prefix, default "msaas"
+      - REDIS_POOL_SIZE             -> optional, default 10
+      - REDIS_MAX_CONNECTIONS       -> optional, default 50
+
+    Circuit breaker:
+      - CIRCUIT_BREAKER_FAILURE_THRESHOLD   -> default 5
+      - CIRCUIT_BREAKER_ROLLING_WINDOW      -> seconds, default 60
+      - CIRCUIT_BREAKER_RECOVERY_TIMEOUT    -> seconds, default 30
+      - CIRCUIT_BREAKER_SUCCESS_THRESHOLD   -> default 2
+
+    Feature flags:
+      - FEATURE_FLAGS_SOURCE         -> "db+redis" (default)
+      - FEATURE_FLAGS_ENABLE_TENANT  -> bool, default true
+      - FEATURE_FLAGS_ENABLE_USER    -> bool, default true
+
+    Service-specific:
+      - WORKER_QUEUE_NAME            -> queue/stream name; optional
+      - WORKER_QUEUE_KIND            -> "redis_stream" (default)
     """
 
-    # Core
-    APP_ENV: str = Field(default="local")
-    SERVICE_NAME: str = Field(default="api")
-    LOG_LEVEL: str = Field(default="INFO")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
 
-    # Database
-    POSTGRES_DSN: str
-    DB_POOL_SIZE: int = Field(default=10)
-    DB_MAX_OVERFLOW: int = Field(default=20)
-    DB_POOL_TIMEOUT: float = Field(default=30.0)
+    # Core
+    APP_ENV: str = Field(
+        default="local",
+        description="Deployment environment: local | dev | staging | prod",
+    )
+    SERVICE_NAME: str = Field(
+        default="api",
+        description="Logical service name used for metrics and logging.",
+    )
+    LOG_LEVEL: str = Field(
+        default="INFO",
+        description="Root log level: DEBUG | INFO | WARNING | ERROR",
+    )
+
+    # Database (async Postgres with asyncpg)
+    POSTGRES_DSN: PostgresDsn = Field(
+        ...,
+        description="Async SQLAlchemy DSN, e.g. postgresql+asyncpg://user:pass@host:5432/dbname",
+    )
+    DB_POOL_SIZE: int = Field(
+        default=10,
+        description="Base size of the DB connection pool.",
+    )
+    DB_MAX_OVERFLOW: int = Field(
+        default=20,
+        description="Maximum overflow connections beyond pool size.",
+    )
+    DB_POOL_TIMEOUT: float = Field(
+        default=30.0,
+        description="Seconds to wait for a connection from the pool.",
+    )
 
     # Redis
-    REDIS_URL: str = Field(default="redis://localhost:6379/0")
-    MSAAS_REDIS_PREFIX: str = Field(default="msaas")
-    REDIS_POOL_SIZE: int = Field(default=10)
-    REDIS_MAX_CONNECTIONS: Optional[int] = Field(default=None)
+    REDIS_URL: str = Field(
+        ...,
+        description="Redis connection URL, e.g. redis://:pass@host:6379/0",
+    )
+    MSAAS_REDIS_PREFIX: str = Field(
+        default="msaas",
+        description='Logical key prefix, combined with APP_ENV as "msaas:{env}:".',
+    )
+    REDIS_POOL_SIZE: int = Field(
+        default=10,
+        description="Base size of the Redis connection pool.",
+    )
+    REDIS_MAX_CONNECTIONS: int = Field(
+        default=50,
+        description="Upper bound on total Redis connections (if supported by client).",
+    )
 
     # Circuit breaker defaults
-    CIRCUIT_BREAKER_FAILURE_THRESHOLD: int = Field(default=5)
-    CIRCUIT_BREAKER_ROLLING_WINDOW: int = Field(default=60)
-    CIRCUIT_BREAKER_RECOVERY_TIMEOUT: int = Field(default=30)
-    CIRCUIT_BREAKER_SUCCESS_THRESHOLD: int = Field(default=2)
+    CIRCUIT_BREAKER_FAILURE_THRESHOLD: int = Field(
+        default=5,
+        description="Number of failures within the rolling window to open the breaker.",
+    )
+    CIRCUIT_BREAKER_ROLLING_WINDOW: int = Field(
+        default=60,
+        description="Rolling window size in seconds for counting failures.",
+    )
+    CIRCUIT_BREAKER_RECOVERY_TIMEOUT: int = Field(
+        default=30,
+        description="Seconds to remain OPEN before attempting HALF_OPEN.",
+    )
+    CIRCUIT_BREAKER_SUCCESS_THRESHOLD: int = Field(
+        default=2,
+        description="Consecutive successes in HALF_OPEN before closing the breaker.",
+    )
 
     # Feature flags
-    FEATURE_FLAGS_SOURCE: str = Field(default="db+redis")
-    FEATURE_FLAGS_ENABLE_TENANT: bool = Field(default=True)
-    FEATURE_FLAGS_ENABLE_USER: bool = Field(default=True)
+    FEATURE_FLAGS_SOURCE: str = Field(
+        default="db+redis",
+        description='Source of truth for flags: "db+redis" by default.',
+    )
+    FEATURE_FLAGS_ENABLE_TENANT: bool = Field(
+        default=True,
+        description="Enable tenant-level feature flags.",
+    )
+    FEATURE_FLAGS_ENABLE_USER: bool = Field(
+        default=True,
+        description="Enable user-level feature flags.",
+    )
 
-    # Worker / queues
-    WORKER_QUEUE_NAME: Optional[str] = Field(default=None)
-    WORKER_QUEUE_KIND: str = Field(default="redis_stream")
+    # Service-specific / workers
+    WORKER_QUEUE_NAME: Optional[str] = Field(
+        default=None,
+        description="Queue/stream name for worker processes; may be derived from SERVICE_NAME.",
+    )
+    WORKER_QUEUE_KIND: str = Field(
+        default="redis_stream",
+        description='Queue kind identifier, default "redis_stream".',
+    )
 
-    class Config:
-        frozen = True
+    @validator("APP_ENV")
+    def _normalize_env(cls, v: str) -> str:
+        """
+        Normalize APP_ENV to one of: local | dev | staging | prod.
+        Accept common synonyms but collapse them for metrics/labels.
+        """
+        if not v:
+            return "local"
+
+        value = v.lower().strip()
+        if value in {"local", "localhost"}:
+            return "local"
+        if value in {"dev", "development"}:
+            return "dev"
+        if value in {"staging", "stage"}:
+            return "staging"
+        if value in {"prod", "production"}:
+            return "prod"
+        # Fallback: keep as-is but lowercase, to avoid surprising breakage
+        return value
+
+    @validator("POSTGRES_DSN", pre=True)
+    def _fallback_database_url(cls, v: Any) -> Any:
+        """
+        Allow DATABASE_URL as a legacy alias for POSTGRES_DSN.
+
+        If POSTGRES_DSN is not set, but DATABASE_URL is, use DATABASE_URL.
+        """
+        if v is not None and v != "":
+            return v
+        legacy = os.getenv("DATABASE_URL")
+        if legacy:
+            return legacy
+        return v
 
     @property
-    def env(self) -> str:
-        """Canonical environment label used for metrics and namespacing."""
+    def env_label(self) -> str:
+        """
+        Normalized environment label used for metrics (`env` label).
+        """
         return self.APP_ENV
 
     @property
-    def service(self) -> str:
-        """Canonical service name label used for metrics."""
+    def service_label(self) -> str:
+        """
+        Service label used for metrics (`service` label).
+        """
         return self.SERVICE_NAME
 
-    @classmethod
-    def from_env(cls) -> "Settings":
-        """Build Settings from environment with support for legacy aliases.
-
-        Canonical names are preferred; legacy aliases are only consulted if the
-        canonical variable is unset.
+    def redis_key_prefix(self) -> str:
         """
+        Compute the canonical Redis key prefix, e.g. "msaas:dev:".
+        """
+        return f"{self.MSAAS_REDIS_PREFIX}:{self.env_label}:"
 
-        env = os.environ
-
-        def pick(
-            primary: str,
-            *aliases: str,
-            default: Optional[str] = None,
-        ) -> Optional[str]:
-            if primary in env and env[primary]:
-                return env[primary]
-            for name in aliases:
-                if name in env and env[name]:
-                    return env[name]
-            return default
-
-        data: Dict[str, Any] = {}
-
-        # Core
-        data["APP_ENV"] = (pick("APP_ENV", "ENV", default="local") or "local").strip()
-        data["SERVICE_NAME"] = (
-            pick("SERVICE_NAME", default="api") or "api"
-        ).strip()
-        data["LOG_LEVEL"] = (
-            pick("LOG_LEVEL", default="INFO") or "INFO"
-        ).strip()
-
-        # Database
-        dsn = pick("POSTGRES_DSN", "DATABASE_URL")
-        if not dsn:
-            raise RuntimeError(
-                "POSTGRES_DSN (or legacy DATABASE_URL) must be set in the environment."
-            )
-        data["POSTGRES_DSN"] = dsn
-        data["DB_POOL_SIZE"] = int(pick("DB_POOL_SIZE", default="10") or "10")
-        data["DB_MAX_OVERFLOW"] = int(pick("DB_MAX_OVERFLOW", default="20") or "20")
-        data["DB_POOL_TIMEOUT"] = float(
-            pick("DB_POOL_TIMEOUT", default="30.0") or "30.0"
-        )
-
-        # Redis
-        data["REDIS_URL"] = (
-            pick("REDIS_URL", default="redis://localhost:6379/0")
-            or "redis://localhost:6379/0"
-        )
-        data["MSAAS_REDIS_PREFIX"] = (
-            pick("MSAAS_REDIS_PREFIX", default="msaas") or "msaas"
-        )
-        data["REDIS_POOL_SIZE"] = int(
-            pick("REDIS_POOL_SIZE", default="10") or "10"
-        )
-        max_conns_raw = pick("REDIS_MAX_CONNECTIONS", default="")
-        data["REDIS_MAX_CONNECTIONS"] = (
-            int(max_conns_raw) if max_conns_raw not in ("", None) else None
-        )
-
-        # Circuit breaker
-        data["CIRCUIT_BREAKER_FAILURE_THRESHOLD"] = int(
-            pick("CIRCUIT_BREAKER_FAILURE_THRESHOLD", default="5") or "5"
-        )
-        data["CIRCUIT_BREAKER_ROLLING_WINDOW"] = int(
-            pick("CIRCUIT_BREAKER_ROLLING_WINDOW", default="60") or "60"
-        )
-        data["CIRCUIT_BREAKER_RECOVERY_TIMEOUT"] = int(
-            pick("CIRCUIT_BREAKER_RECOVERY_TIMEOUT", default="30") or "30"
-        )
-        data["CIRCUIT_BREAKER_SUCCESS_THRESHOLD"] = int(
-            pick("CIRCUIT_BREAKER_SUCCESS_THRESHOLD", default="2") or "2"
-        )
-
-        # Feature flags
-        data["FEATURE_FLAGS_SOURCE"] = (
-            pick("FEATURE_FLAGS_SOURCE", default="db+redis") or "db+redis"
-        )
-        data["FEATURE_FLAGS_ENABLE_TENANT"] = _read_bool(
-            pick("FEATURE_FLAGS_ENABLE_TENANT", default=None),
-            default=True,
-        )
-        data["FEATURE_FLAGS_ENABLE_USER"] = _read_bool(
-            pick("FEATURE_FLAGS_ENABLE_USER", default=None),
-            default=True,
-        )
-
-        # Worker-specific
-        data["WORKER_QUEUE_NAME"] = pick("WORKER_QUEUE_NAME", default=None)
-        data["WORKER_QUEUE_KIND"] = (
-            pick("WORKER_QUEUE_KIND", default="redis_stream") or "redis_stream"
-        )
-
-        try:
-            return cls(**data)
-        except ValidationError as exc:
-            raise RuntimeError(f"Invalid configuration: {exc}") from exc
+    def describe(self) -> dict[str, Any]:
+        """
+        Lightweight, non-secret representation suitable for logging/debugging.
+        """
+        return {
+            "APP_ENV": self.APP_ENV,
+            "SERVICE_NAME": self.SERVICE_NAME,
+            "LOG_LEVEL": self.LOG_LEVEL,
+            "DB_POOL_SIZE": self.DB_POOL_SIZE,
+            "DB_MAX_OVERFLOW": self.DB_MAX_OVERFLOW,
+            "DB_POOL_TIMEOUT": self.DB_POOL_TIMEOUT,
+            "REDIS_POOL_SIZE": self.REDIS_POOL_SIZE,
+            "REDIS_MAX_CONNECTIONS": self.REDIS_MAX_CONNECTIONS,
+            "FEATURE_FLAGS_SOURCE": self.FEATURE_FLAGS_SOURCE,
+            "FEATURE_FLAGS_ENABLE_TENANT": self.FEATURE_FLAGS_ENABLE_TENANT,
+            "FEATURE_FLAGS_ENABLE_USER": self.FEATURE_FLAGS_ENABLE_USER,
+            "WORKER_QUEUE_NAME": self.WORKER_QUEUE_NAME,
+            "WORKER_QUEUE_KIND": self.WORKER_QUEUE_KIND,
+        }
 
 
+@lru_cache
 def get_settings() -> Settings:
-    """Return a cached Settings instance (process-wide singleton).
-
-    The first call reads from environment; subsequent calls return the same
-    immutable Settings object.
     """
-    global _SETTINGS
-    if _SETTINGS is None:
-        with _ENV_LOCK:
-            if _SETTINGS is None:
-                _SETTINGS = Settings.from_env()
-    return _SETTINGS
+    Return a cached Settings instance.
+
+    This is safe to use across the application (FastAPI app, workers,
+    agents, metrics) and avoids re-parsing the environment repeatedly.
+    """
+    return Settings()
