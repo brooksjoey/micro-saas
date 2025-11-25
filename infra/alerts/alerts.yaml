@@ -1,0 +1,195 @@
+groups:
+  - name: api-latency
+    rules:
+      - alert: HighAPILatencyP95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, service, env) (
+              rate(http_server_request_duration_seconds_bucket[5m])
+            )
+          ) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+          service: api
+        annotations:
+          summary: "API p95 latency above 500ms"
+          description: "API p95 latency is above 500ms for service={{ $labels.service }}, env={{ $labels.env }}."
+          runbook_url: "https://runbooks.internal/msaas/HighAPILatencyP95"
+
+      - alert: HighAPILatencyP99
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le, service, env) (
+              rate(http_server_request_duration_seconds_bucket[5m])
+            )
+          ) > 1
+        for: 10m
+        labels:
+          severity: critical
+          service: api
+        annotations:
+          summary: "API p99 latency above 1s"
+          description: "API p99 latency is above 1s for service={{ $labels.service }}, env={{ $labels.env }}."
+          runbook_url: "https://runbooks.internal/msaas/HighAPILatencyP99"
+
+  - name: jobs-health
+    rules:
+      - alert: GenericJobFailureRateHigh
+        expr: |
+          sum by (service, env, job_type) (
+            rate(msaas_job_errors_total[5m])
+          )
+          /
+          sum by (service, env, job_type) (
+            rate(msaas_job_processing_duration_seconds_count[5m])
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: critical
+          service: worker-generic
+        annotations:
+          summary: "Generic job failure rate above 5%"
+          description: "Failure rate for job_type={{ $labels.job_type }} is above 5% in env={{ $labels.env }}, service={{ $labels.service }}."
+          runbook_url: "https://runbooks.internal/msaas/GenericJobFailureRateHigh"
+
+      - alert: BrowserJobFailureRateHigh
+        expr: |
+          sum by (service, env) (
+            rate(jobs_browser_errors_total[5m])
+          )
+          /
+          sum by (service, env) (
+            rate(jobs_browser_processed_total[5m])
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: critical
+          service: browser-worker
+        annotations:
+          summary: "Browser job failure rate above 5%"
+          description: "Browser worker job failure rate is above 5% for service={{ $labels.service }}, env={{ $labels.env }}."
+          runbook_url: "https://runbooks.internal/msaas/BrowserJobFailureRateHigh"
+
+      - alert: JobBacklogHigh
+        expr: |
+          msaas_queue_depth > 1000
+        for: 15m
+        labels:
+          severity: warning
+          service: worker
+        annotations:
+          summary: "Job backlog high"
+          description: "Queue depth is high for queue_name={{ $labels.queue_name }}, queue_kind={{ $labels.queue_kind }}, service={{ $labels.service }}, env={{ $labels.env }}."
+          runbook_url: "https://runbooks.internal/msaas/JobBacklogHigh"
+
+  - name: auth-billing
+    rules:
+      - alert: JWTInvalidRateHigh
+        expr: |
+          sum by (env, issuer) (
+            rate(auth_jwt_invalid_total[5m])
+          )
+          /
+          sum by (env, issuer) (
+            rate(msaas_jwt_validation_duration_seconds_count[5m])
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          service: api
+        annotations:
+          summary: "JWT invalid rate above 5%"
+          description: "JWT invalid rate is above 5% for issuer={{ $labels.issuer }}, env={{ $labels.env }}."
+          runbook_url: "https://runbooks.internal/msaas/JWTInvalidRateHigh"
+
+      - alert: BillingReconciliationMissing
+        expr: |
+          time() - max by (env, provider, service) (
+            billing_reconciliation_last_success_timestamp
+          ) > 86400
+        for: 10m
+        labels:
+          severity: warning
+          service: billing-cron
+        annotations:
+          summary: "Billing reconciliation has not run in 24h"
+          description: "Last successful billing reconciliation for provider={{ $labels.provider }}, env={{ $labels.env }}, service={{ $labels.service }} was more than 24h ago."
+          runbook_url: "https://runbooks.internal/msaas/BillingReconciliationMissing"
+
+      - alert: StripeCircuitOpen
+        expr: |
+          circuit_state{breaker_name="stripe"} == 1
+        for: 5m
+        labels:
+          severity: warning
+          service: api
+        annotations:
+          summary: "Stripe circuit breaker open"
+          description: "Stripe circuit breaker is open for env={{ $labels.env }}, service={{ $labels.service }}."
+          runbook_url: "https://runbooks.internal/msaas/StripeCircuitOpen"
+
+      - alert: BrowserCircuitOpen
+        expr: |
+          circuit_state{breaker_name="playwright"} == 1
+        for: 5m
+        labels:
+          severity: warning
+          service: browser-worker
+        annotations:
+          summary: "Browser circuit breaker open"
+          description: "Playwright/browser circuit breaker is open for env={{ $labels.env }}, service={{ $labels.service }}."
+          runbook_url: "https://runbooks.internal/msaas/BrowserCircuitOpen"
+
+  - name: agents
+    rules:
+      - alert: AgentWorkflowFailureRateHigh
+        expr: |
+          sum by (service, env, workflow_name) (
+            rate(agents_workflow_execution_seconds_count{outcome!="success"}[5m])
+          )
+          /
+          sum by (service, env, workflow_name) (
+            rate(agents_workflow_execution_seconds_count[5m])
+          ) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+          service: agents
+        annotations:
+          summary: "Agent workflow failure rate above 10%"
+          description: "Failure rate for workflow_name={{ $labels.workflow_name }} is above 10% in env={{ $labels.env }}, service={{ $labels.service }}."
+          runbook_url: "https://runbooks.internal/msaas/AgentWorkflowFailureRateHigh"
+
+      - alert: AgentFallbackRateHigh
+        expr: |
+          sum by (service, env, workflow_name, fallback_type) (
+            rate(msaas_agent_fallback_total[5m])
+          ) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+          service: agents
+        annotations:
+          summary: "Agent fallback usage high"
+          description: "Fallback usage is high for workflow_name={{ $labels.workflow_name }}, fallback_type={{ $labels.fallback_type }}, env={{ $labels.env }}, service={{ $labels.service }}."
+          runbook_url: "https://runbooks.internal/msaas/AgentFallbackRateHigh"
+
+      - alert: AgentWorkflowLatencyP95High
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, service, env, workflow_name) (
+              rate(agents_workflow_execution_seconds_bucket[5m])
+            )
+          ) > 5
+        for: 10m
+        labels:
+          severity: warning
+          service: agents
+        annotations:
+          summary: "Agent workflow p95 latency above 5s"
+          description: "Agent workflow p95 latency is above 5s for workflow_name={{ $labels.workflow_name }}, env={{ $labels.env }}, service={{ $labels.service }}."
+          runbook_url: "https://runbooks.internal/msaas/AgentWorkflowLatencyP95High"
