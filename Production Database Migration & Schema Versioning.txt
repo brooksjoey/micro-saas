@@ -1,0 +1,293 @@
+Production Database Migration & Schema Versioning
+
+# Production Database Migration & Schema Versioning
+
+## Alembic Migration: Auth/Billing/Usage Schema + Jobs Enhancement
+
+### Migration File: `alembic/versions/202501010900_add_auth_billing_usage_tables.py`
+
+
+`"""add auth billing usage tables`
+
+```
+Revision ID: 202501010900
+Revises: <PREVIOUS_REVISION_ID>
+Create Date: 2025-01-01 09:00:00.000000
+```
+
+"""
+
+```
+from alembic import op
+import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
+
+```
+
+```
+# Revision identifiers, used by Alembic
+revision = '202501010900'
+down_revision = '<PREVIOUS_REVISION_ID>'
+branch_labels = None
+depends_on = None
+
+def upgrade() -> None:
+    # Ensure citext extension for case-insensitive emails
+    op.execute('CREATE EXTENSION IF NOT EXISTS citext')
+```
+
+    # Users table - mirrors Supabase auth users with Stripe linkage
+    op.create_table('users',
+        sa.Column('id', postgresql.UUID(as_uuid=True), nullable=False, primary_key=True),
+        sa.Column('email', postgresql.CITEXT(), nullable=False),
+        sa.Column('stripe_customer_id', sa.Text(), nullable=True),
+        sa.Column('created_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.text('now()'), nullable=False),
+        sa.Column('updated_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.text('now()'), nullable=False)
+    )
+    op.create_index('users_email_idx', 'users', ['email'], unique=True)
+
+    # Subscriptions - current subscription state per user
+    op.create_table('subscriptions',
+        sa.Column('id', sa.BigInteger(), primary_key=True, autoincrement=True),
+        sa.Column('user_id', postgresql.UUID(as_uuid=True), sa.ForeignKey('users.id', ondelete='CASCADE'), nullable=False),
+        sa.Column('stripe_subscription_id', sa.Text(), nullable=False, unique=True),
+        sa.Column('plan', sa.Text(), nullable=False),  # 'FREE', 'PRO', 'ENTERPRISE'
+        sa.Column('status', sa.Text(), nullable=False),  # 'active', 'past_due', 'canceled', etc.
+        sa.Column('current_period_start', postgresql.TIMESTAMP(timezone=True), nullable=False),
+        sa.Column('current_period_end', postgresql.TIMESTAMP(timezone=True), nullable=False),
+        sa.Column('created_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.text('now()'), nullable=False),
+        sa.Column('updated_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.text('now()'), nullable=False)
+    )
+    op.create_index('subscriptions_user_id_idx', 'subscriptions', ['user_id'])
+    op.create_index('subscriptions_status_idx', 'subscriptions', ['status'])
+
+    # Usage counters - aggregated usage per billing period
+    op.create_table('usage_counters',
+        sa.Column('id', sa.BigInteger(), primary_key=True, autoincrement=True),
+        sa.Column('user_id', postgresql.UUID(as_uuid=True), sa.ForeignKey('users.id', ondelete='CASCADE'), nullable=False),
+        sa.Column('period_start', postgresql.TIMESTAMP(timezone=True), nullable=False),
+        sa.Column('period_end', postgresql.TIMESTAMP(timezone=True), nullable=False),
+        sa.Column('jobs_used', sa.Integer(), nullable=False, server_default='0'),
+        sa.Column('jobs_limit', sa.Integer(), nullable=True),
+        sa.Column('credits_remaining', sa.Integer(), nullable=True),
+        sa.Column('last_reconciled_at', postgresql.TIMESTAMP(timezone=True), nullable=True),
+        sa.Column('created_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.text('now()'), nullable=False),
+        sa.Column('updated_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.text('now()'), nullable=False)
+    )
+    op.create_index('usage_counters_user_idx', 'usage_counters', ['user_id'])
+    op.create_unique_constraint('usage_counters_user_period_uniq', 'usage_counters', ['user_id', 'period_start', 'period_end'])
+
+    # Usage events - append-only audit log for all usage changes
+    op.create_table('usage_events',
+        sa.Column('id', sa.BigInteger(), primary_key=True, autoincrement=True),
+        sa.Column('user_id', postgresql.UUID(as_uuid=True), sa.ForeignKey('users.id', ondelete='CASCADE'), nullable=False),
+        sa.Column('kind', sa.Text(), nullable=False),  # 'job_run', 'credit_change', 'stripe_event', 'reconciliation'
+        sa.Column('amount', sa.Integer(), nullable=False),  # +1 job, -1 credit, etc.
+        sa.Column('job_id', postgresql.UUID(as_uuid=True), nullable=True),
+        sa.Column('stripe_event_id', sa.Text(), nullable=True),
+        sa.Column('metadata', postgresql.JSONB(), nullable=False, server_default=sa.text("'{}'::jsonb")),
+        sa.Column('occurred_at', postgresql.TIMESTAMP(timezone=True), nullable=False),
+        sa.Column('created_at', postgresql.TIMESTAMP(timezone=True), server_default=sa.text('now()'), nullable=False)
+    )
+    op.create_index('usage_events_user_time_idx', 'usage_events', ['user_id', 'occurred_at'])
+    op.create_index('usage_events_stripe_event_id_idx', 'usage_events', ['stripe_event_id'], unique=True, postgresql_where=sa.text('stripe_event_id IS NOT NULL'))
+
+    # Enhance existing jobs table with user context and correlation IDs
+    op.add_column('jobs', sa.Column('user_id', postgresql.UUID(as_uuid=True), nullable=True))
+    op.add_column('jobs', sa.Column('correlation_id', postgresql.UUID(as_uuid=True), nullable=True))
+    
+    # Foreign key and indexes for jobs table
+    op.create_foreign_key('jobs_user_id_fkey', 'jobs', 'users', ['user_id'], ['id'], ondelete='SET NULL')
+    op.create_index('jobs_user_created_at_idx', 'jobs', ['user_id', 'created_at'])
+    op.create_index('jobs_correlation_id_idx', 'jobs', ['correlation_id'])
+
+```
+def downgrade() -> None:
+    # Remove jobs table enhancements
+    op.drop_index('jobs_correlation_id_idx', table_name='jobs')
+    op.drop_index('jobs_user_created_at_idx', table_name='jobs')
+    op.drop_constraint('jobs_user_id_fkey', 'jobs', type_='foreignkey')
+    op.drop_column('jobs', 'correlation_id')
+    op.drop_column('jobs', 'user_id')
+```
+
+    # Remove usage events
+    op.drop_index('usage_events_stripe_event_id_idx', table_name='usage_events')
+    op.drop_index('usage_events_user_time_idx', table_name='usage_events')
+    op.drop_table('usage_events')
+
+    # Remove usage counters
+    op.drop_constraint('usage_counters_user_period_uniq', 'usage_counters', type_='unique')
+    op.drop_index('usage_counters_user_idx', table_name='usage_counters')
+    op.drop_table('usage_counters')
+
+    # Remove subscriptions
+    op.drop_index('subscriptions_status_idx', table_name='subscriptions')
+    op.drop_index('subscriptions_user_id_idx', table_name='subscriptions')
+    op.drop_table('subscriptions')
+
+    # Remove users
+    op.drop_index('users_email_idx', table_name='users')
+    op.drop_table('users')
+
+    # Note: citext extension intentionally left installed
+	
+
+## 2.	Schema Versioning Policy
+
+1 Single Source of Truth
+
+· Schema Owner: FastAPI backend service exclusively manages schema changes
+· Migration-Only Changes: No ad-hoc DDL outside Alembic migrations
+· Centralized Control: All services share the same database schema
+
+## 2.2 Revision Management
+
+```bash
+# Create new migration
+alembic revision -m "add_feature_x_tables"
+
+# Check migration state
+alembic current
+alembic heads
+
+# Resolve multiple heads
+alembic merge -m "merge_feature_branches"
+
+# Apply migrations
+alembic upgrade head
+alembic downgrade -1
+```
+
+Naming Convention: YYYYMMDDHHMM_descriptive_name.py
+
+## 2.3 Environment-Specific Workflows
+
+Development
+
+```bash
+# On feature branch
+alembic upgrade head
+
+# Reset and rebuild
+alembic downgrade base && alembic upgrade head
+
+# Check migration status
+alembic history --verbose
+```
+
+**Staging/Production**
+
+```yaml
+# CI/CD Pipeline
+- name: Database Migration
+  run: |
+    alembic upgrade head
+    alembic current --verbose
+    
+- name: Verify Migration
+  run: |
+    python -c "
+    from alembic.config import Config
+    from alembic import command
+    config = Config('alembic.ini')
+    command.current(config, verbose=True)
+    "
+```
+
+## 2.4 Backward Compatibility Rules
+
+Additive-Only in Single Deployment
+
+· Add columns/tables first, remove later
+· New code must work with old schema during rollout
+· Use feature flags to control new functionality
+
+**Two-Phase Breaking Changes**
+
+```python
+# Phase 1: Add new column, maintain both
+def upgrade():
+    op.add_column('users', sa.Column('new_preferences', postgresql.JSONB(), nullable=True))
+    
+# Phase 2: Remove old column (after full deployment)
+def upgrade():
+    op.drop_column('users', 'old_preferences')
+```
+
+Data Migration Safety
+
+· Large data backfills: Use background jobs, not migration transactions
+· Small data fixes: Use idempotent operations in migrations
+· Validation: Include data integrity checks in migration tests
+
+## 2.5 Observability & Health Checks
+
+Schema Version Endpoint
+
+```python
+# app/routes/internal.py
+@router.get("/schema-version")
+async def get_schema_version(db: AsyncSession = Depends(get_db_session)):
+    result = await db.execute(sa.text("SELECT version_num FROM alembic_version"))
+    version = result.scalar()
+    return {"revision": version, "status": "healthy"}
+```
+
+## Prometheus Metrics
+
+```python
+# app/monitoring.py
+DB_SCHEMA_VERSION = Gauge(
+    'db_schema_version',
+    'Current database schema version',
+    ['service']
+)
+```
+
+## 2.6 Emergency Procedures
+
+Failed Migration Rollback
+
+```bash
+# Immediate rollback
+alembic downgrade -1
+
+# Investigation
+alembic current --verbose
+alembic history --verbose
+
+# Recovery
+alembic upgrade +1  # Skip broken migration
+# OR
+alembic downgrade base && alembic upgrade head  # Full rebuild
+```
+
+Production Verification Checklist
+
+· Migration tested on staging identical to production
+· Backward compatibility verified
+· Rollback procedure documented and tested
+· Performance impact assessed
+· Data integrity validated post-migration
+
+**Critical Implementation Notes**
+
+**Required Next Steps**
+
+1. Fill down_revision: Replace <PREVIOUS_REVISION_ID> with actual previous migration ID
+2. Create SQLAlchemy Models: Generate matching ORM models for new tables
+3. Implement UsageRepository: Encapsulate billing logic with transaction safety
+4. Add RLS Policies: Implement Row-Level Security for multi-tenant data isolation
+5. Create Migration Tests: Verify both upgrade and downgrade paths
+
+**Security Considerations**
+
+· RLS policies required on all user-facing tables
+· Audit trails via usage_events for compliance
+· Sensitive data encryption at application layer
+· Migration access restricted to deployment service account
+
+This migration establishes the foundation for enterprise-grade user management, billing enforcement, and comprehensive usage tracking while maintaining strict schema versioning discipline.
+
+```

@@ -1,0 +1,119 @@
+Phase 3 Full Implemetation
+
+# Phase 3 Reconciliation Analysis
+
+**Detected Inconsistencies**
+
+1. User Context Missing in Current Models
+
+	- · Phase 1/2: Job model has user_id column but no actual user management
+	- · Phase 3: Requires full user, subscription, and usage tracking tables
+
+2. Authentication Middleware Gap
+
+	- · Current: Basic CorrelationIdMiddleware exists
+	- · Phase 3: Needs JWT validation, plan enforcement, rate limiting per user
+
+3. Configuration Expansion Required
+
+	- · Current: Settings has Supabase URL/key but no Stripe or auth-specific configs
+	- · Phase 3: Needs Stripe keys, plan limits, reconciliation intervals
+
+4. Metrics Naming Inconsistency
+
+	- · Current: jobs_browser_* metrics
+	- · Phase 3: Needs billing_*, auth_*, usage_* metrics with consistent labels
+
+5. Circuit Breaker Scope
+
+	- · Current: Only Playwright circuit breaker
+	- · Phase 3: Needs Stripe API circuit breaker with shared pattern
+
+6. Feature Flag Gaps
+
+	- · Current: Browser task flags only
+	- · Phase 3: Needs billing enforcement flags, plan feature flags
+	
+---
+
+**ADR-0003: User Management & Billing Integration**
+
+# ADR-0003: User Management & Billing Integration
+
+## Status
+**Accepted** - 2024-01-16
+
+## Context
+Phases 1-2 established job processing with user_id references but no actual user management. Phase 3 introduces Supabase Auth, Stripe Billing, and usage-based subscription enforcement while maintaining enterprise-grade observability and security standards.
+
+## Decision
+
+## 1. Database Schema Evolution
+- **New Tables**: `users`, `subscriptions`, `usage_counters`, `usage_events`
+- **RLS Policies**: All user-data tables enable RLS with `user_id` checks
+- **Backward Compatibility**: Existing `jobs` table maintains current structure with enhanced user context
+
+## 2. Authentication & Authorization
+- **JWT Validation**: Reusable `JWKSCache` with 5-minute TTL, fail-closed on Supabase outage
+- **Middleware Chain**: `AuthMiddleware` → `PlanEnforcementMiddleware` → `RateLimitMiddleware`
+- **User Context**: `user_id` injected into request state for all downstream processing
+
+## 3. Billing Integration Pattern
+- **Stripe Webhooks**: Idempotent processing with `stripe_event_id` deduplication
+- **Metered Usage**: Job completions reported to Stripe via usage records
+- **Circuit Breaker**: Shared `CircuitBreaker` for Stripe API calls (failure_threshold=3, reset_timeout=30s)
+
+## 4. Configuration Unification
+```python
+# Extended Settings
+STRIPE_SECRET_KEY: str
+STRIPE_WEBHOOK_SECRET: str  
+SUPABASE_JWT_JWKS_URL: AnyHttpUrl
+SUPABASE_JWT_AUDIENCE: str
+
+# Plan limits
+PLAN_LIMITS: Dict[str, Dict] = {
+    "FREE": {"jobs_per_month": 100, "browser_jobs": False},
+    "PRO": {"jobs_per_month": 1000, "browser_jobs": True},
+    "ENTERPRISE": {"jobs_per_month": None, "browser_jobs": True}
+}
+```
+
+**5. Metrics & Observability**
+
+- · New Metrics:
+  - · auth_jwt_validation_duration_seconds (Histogram)
+  - · billing_webhook_processing_total (Counter)
+  - · usage_jobs_used_per_user (Gauge)
+  - · subscription_plan_users (Gauge)
+- · Trace Attributes: user.id, user.plan, stripe.customer_id
+
+**6. Feature Flags**
+
+- · FF_BILLING_ENFORCEMENT_ENABLED (global billing toggle)
+- · FF_PLAN_{PLAN_NAME}_ENABLED (per-plan activation)
+- · FF_STRIPE_WEBHOOKS_ENABLED (webhook processing toggle)
+
+## Consequences
+
+- · Enhanced Security: RLS policies prevent data leakage between users
+- · Usage Tracking: Complete audit trail of job consumption and billing events
+- · Operational Overhead: Daily reconciliation job requires monitoring
+- · Vendor Dependencies: Supabase Auth + Stripe Billing introduce external SLAs
+
+---
+
+## Phase 3 Implementation Ready
+
+The reconciliation is complete. Phase 3 will now be implemented with:
+
+1. **Extended database schema** with RLS policies
+2. **JWT authentication middleware** with <2ms overhead target  
+3. **Stripe webhook handlers** with idempotency and circuit breakers
+4. **Plan-based enforcement** integrated into existing job routes
+5. **Daily reconciliation** with Prometheus metrics
+6. **Comprehensive tests** covering auth, billing, and plan scenarios
+
+All implementations will maintain the existing enterprise-grade standards from Phases 1-2 while adding the required user management and billing capabilities.
+
+**Shall I proceed with the Phase 3 implementation?**

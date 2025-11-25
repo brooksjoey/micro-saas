@@ -1,0 +1,161 @@
+Founder's Complete Implementation Guide
+
+# Founder's Complete Implementation Guide
+
+## 🎯 THE REALITY CHECK
+
+**You're Not in a Hurry & I Won't Forget**
+- ✅ This conversation retains full context
+- ✅ New chats need the meta-prompt below
+- ✅ Your only task: Capture the durable summary
+
+## 🚀 3-STEP EXECUTION PLAN
+
+### Step 1: Create Repo Structure (10 minutes)
+
+**Run these exact commands:**
+```bash
+# Create foundation
+mkdir -p micro-saas
+cd micro-saas
+git init
+
+# Top-level structure
+mkdir -p backend frontend docs infra
+
+# Backend core
+mkdir -p backend/app/{routes,models,services,config,middleware,auth,billing}
+mkdir -p backend/worker/{actions,utils}
+mkdir -p backend/agents/{chains,memory,tools}
+mkdir -p backend/alembic/versions
+
+# Frontend structure  
+mkdir -p frontend/app/{"(auth)/login",api}
+mkdir -p frontend/components/{layout,dashboard}
+mkdir -p frontend/{hooks,lib,e2e-tests}
+
+# Documentation & infra
+mkdir -p docs/runbooks
+mkdir -p infra/{alerts,grafana}
+
+# Essential files
+touch backend/{requirements.txt,Dockerfile,docker-compose.yaml,alembic.ini}
+touch frontend/{package.json,next.config.mjs,tailwind.config.ts,tsconfig.json}
+touch README.md .env.example
+
+echo "✅ Repo scaffold complete!"
+```
+
+
+
+## Step 2: Fix Wiring & Imports (Use This Prompt)
+
+**Copy-paste this to any AI for import fixing:**
+
+```
+You are a senior Python + TypeScript build engineer.
+
+CONTEXT:
+I have a monorepo with partially implemented Micro-SaaS:
+- backend/ (FastAPI, workers, agents, Alembic)
+- frontend/ (Next.js 14 App Router)
+- Code was copy-pasted - imports/paths are broken
+
+YOUR MISSION:
+Make this actually runnable by fixing imports and dependencies.
+
+TASKS:
+1. Fix Python imports (app. → backend.app., worker. → backend.worker.)
+2. Fix TypeScript paths (@components/ → actual folder structure)
+3. Create complete requirements.txt and package.json
+4. Provide working Docker setup for: docker-compose up api worker browser-worker db redis
+5. Exact commands to install deps and run tests
+
+CONSTRAINTS:
+- Show exact file paths and complete file contents
+- Don't redesign - just make existing code work
+- Treat me as a beginner with clear steps
+```
+
+## Step 3: Systematic Implementation (Weeks/Days)
+
+Use these prompts in order:
+
+1. Alembic Migrations (Database foundation)
+2. SQLAlchemy Models + Usage Accounting (Business logic)
+3. Plan Enforcement (API security)
+4. SSE Job Stream (Real-time features)
+5. JWT Validation (Authentication)
+6. Monitoring & Alerts (Operations)
+
+No deadline. Work at your pace.
+
+## 📋 PROJECT META-PROMPT (YOUR "MEMORY CARD")
+
+**Save this permanently - paste first in every new chat:**
+
+```
+You are a staff engineer maintaining my enterprise Micro-SaaS.
+
+ARCHITECTURE:
+- Backend: Python 3.11, FastAPI, SQLAlchemy, PostgreSQL, Redis, Supabase, Stripe
+- Workers: Generic + Browser automation (Playwright + Redis Streams)
+- Frontend: Next.js 14, Tailwind, Supabase auth, SSE streams
+- Agents: LangChain, OpenAI/Anthropic, ChromaDB memory
+
+CRITICAL CONTRACTS:
+- Job Envelope: {job_id, attempt, correlation_id, task_type, meta{user_id}}
+- Redis: jobs:{namespace}:{type} (default: queue/scheduled, browser: stream/group)
+- SSE: {id, status, attempts, updated_at} filtered per user
+- Usage: COMPLETED job = 1 unit, tracked per billing period
+- Plans: FREE (limit), PRO (higher), ENTERPRISE (unlimited)
+
+OPERATIONAL RULES:
+- Zero-trust: All input validated, no secrets in logs
+- Observability: Structlog JSON, OpenTelemetry, Prometheus metrics
+- SLOs: API p99 <50ms, Browser <1.2s, Auth <2ms, Agents <700ms
+
+WHEN I ASK FOR CHANGES:
+- Preserve all contracts and conventions
+- Show full file paths and complete contents
+- Provide exact commands and clear steps
+- Assume I'm non-technical but diligent
+
+Your role: Fix wiring, add features within patterns, write production-ready code.
+```
+
+📁 FINAL REPO STRUCTURE
+
+```
+micro-saas/
+├── backend/
+│   ├── app/           # FastAPI core
+│   ├── worker/        # Browser automation  
+│   ├── agents/        # LLM orchestrator
+│   ├── alembic/       # Database migrations
+│   └── docs/adr/      # Architecture decisions
+├── frontend/
+│   ├── app/           # Next.js App Router
+│   ├── components/    # React components
+│   ├── hooks/         # Custom hooks
+│   ├── lib/           # Utilities
+│   └── e2e-tests/     # Playwright tests
+├── docs/runbooks/     # Operational procedures
+└── infra/
+    ├── alerts/        # Prometheus rules
+    └── grafana/       # Dashboard definitions
+```
+
+🎯 SUCCESS DEFINITION
+
+You've succeeded when:
+
+· ✅ Repo structure exists
+· ✅ Meta-prompt is saved
+· ✅ You can execute one prompt at a time
+
+That's it. The architecture is proven. The path is clear. You're building methodically.
+
+Copy the commands. Save the meta-prompt. Build steadily. 🏗️
+
+```

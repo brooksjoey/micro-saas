@@ -1,0 +1,346 @@
+Phase 2 Reconciliation / ADR 002
+
+PROMPT:
+
+[The entire Phase 2 reconciliation analysis and ADR content as provided...]
+
+---
+
+RESPONSE:
+
+Phase 2 Reconciliation & Unification
+
+Detected Inconsistencies Between Phase 1 and Proposed Phase 2
+
+1.1 Naming Conventions
+
+Settings/Config Naming
+
+· Phase 1: app.config.Settings + get_settings()
+· Phase 2 draft: worker.config.WorkerSettings + get_worker_settings()
+· Issue: Cross-cutting configuration (Redis URLs, job max attempts) could diverge
+
+Redis Keys
+
+· Phase 1:
+  · Primary queue: jobs:queue (list)
+  · Scheduled retries: jobs:scheduled (sorted set)
+  · Locks: jobs:lock:{job_id}
+· Phase 2 draft:
+  · Stream: jobs:stream:browser
+  · Consumer group: browser-workers
+· Issue: Different patterns (jobs:* vs jobs:stream:*), consumer group not namespaced
+
+Job Identifiers and Payload Schema
+
+· Phase 1: Redis list payload: {"job_id": str(job.id), "attempt": 0} (no correlation ID, no task type)
+· Phase 2 draft: Redis stream payload: {"job_id", "attempt", "correlation_id", ...} parsed from fields["payload"]
+· Issue: No unified schema for "job message"
+
+Module/Package Layout
+
+· Phase 1 worker: app/workers/job_worker.py
+· Phase 2 draft: New top-level package worker/ plus utils/ and actions/
+· Issue: Splits workers conceptually between app.workers and worker with different naming patterns
+
+1.2 Dependency and Version Inconsistencies
+
+Redis
+
+· Phase 1: redis[hiredis]==5.0.7, redis.asyncio.from_url(..., decode_responses=True, encoding="utf-8")
+· Phase 2 draft: redis.asyncio.from_url(..., decode_responses=False) in the engine
+· Issue: Inconsistent encoding/decoding behavior
+
+Prometheus/Metrics
+
+· Phase 1: prometheus-fastapi-instrumentator for HTTP metrics; no direct use of prometheus-client
+· Phase 2 draft: Explicit prometheus-client histograms, counters, gauge plus HTTP metrics endpoint in worker
+· Acceptable: But metric naming conventions must be aligned
+
+OpenTelemetry
+
+· Phase 1: Global tracer provider via app.telemetry.setup_tracing() plus FastAPI/SQLAlchemy/Redis instrumentation
+· Phase 2 draft: Manual spans (e.g., "job.automation") with no defined naming convention
+· Issue: Inconsistent naming scheme; unclear linkage to existing traces
+
+1.3 Correlation ID Propagation
+
+Phase 1
+
+· Middleware sets x-request-id header and correlation_id_var
+· Job enqueue route sets correlation_id_var from header or generated UUID
+· Redis payload for worker does not include correlation ID; workers fabricate e.g., job-{job_id}-{attempt}
+
+Phase 2 Draft
+
+· Stream parser optionally reads correlation_id from message payload, falls back to uuid4()
+· Issue: No guarantee this matches original HTTP correlation ID
+· Result: Correlation IDs won't propagate end-to-end from HTTP request → DB → queues → worker logs and spans
+
+1.4 Redis Streams Group Naming and Semantics
+
+Phase 1: List + sorted set with custom retry logic; no Streams or consumer groups
+Phase 2 Draft:Single group "browser-workers" on key "jobs:stream:browser", worker acks on success/failure
+Issue:No common naming/operational pattern; no dead-letter queues or pending-claiming strategy
+
+1.5 Circuit Breaker Policies
+
+Phase 1 worker: No circuit breaker around Playwright (or any external service)
+Phase 2 Draft:Local CircuitBreaker in utils.circuit_breaker used only in browser worker
+Issue:Policy knobs not aligned with global standard; library not reused by other components
+
+1.6 Feature Flags
+
+Phase 1: No explicit feature flag keys (though project rules require them)
+Phase 2 Draft:No feature flags mentioned
+Issue:Cannot toggle browser worker or specific task types
+
+1.7 Logging Format
+
+Phase 1: app.logging.configure_logging() sets structlog JSON renderer with event renamed to message, injects correlation_id and job_id
+Phase 2 Draft:Imports get_logger() and configure_logging() from app.logging, uses same JSON style
+Issue:Log fields differ in naming (e.g., "job_stream_message_processed" vs "job_enqueued"), but correlation ID propagation is primary mismatch
+
+1.8 Docker and Docker Compose
+
+Phase 1: Single Dockerfile builds app image for API and app.workers.job_worker; no OCI/Compose labels
+Phase 2 Draft:New worker.run module runs from same image; no labels or environment convention
+Issue:No unified labeling scheme or clear mapping between services and roles
+
+---
+
+Unified Decisions
+
+2.1 Global Configuration and Naming
+
+Config Objects
+
+· Keep app.config.Settings as source of truth for: POSTGRES_DSN, REDIS_URL, JOB_MAX_ATTEMPTS, OTEL/Sentry options
+· Keep worker.config.WorkerSettings for worker-specific knobs only: stream key names, consumer group, concurrency, Playwright options, circuit breaker thresholds, metrics port
+· Shared constants derived from app.config.Settings, not duplicated
+
+Redis Key Naming
+
+· Pattern: jobs:{namespace}:{type}
+· Generic worker: jobs:default:queue, jobs:default:scheduled, jobs:default:lock:{job_id}
+· Browser worker: jobs:browser:stream, jobs:browser:group, jobs:browser:dlq
+
+Job Message Schema
+
+```json
+{
+  "job_id": "uuid",
+  "attempt": 0,
+  "correlation_id": "uuid-or-upstream-id",
+  "task_type": "string",
+  "meta": {
+    "enqueue_ts": "ISO8601",
+    "...": "..."
+  }
+}
+```
+
+Module Layout
+
+· All workers share cross-cutting utilities
+· utils/ and actions/ remain top-level but versioned for both app.workers.* and worker.*
+· Circuit breaker and Playwright manager are reusable
+· Entrypoints: CPU worker remains app.workers.job_worker, browser worker lives in worker.run
+
+2.2 Redis Streams and Semantics
+
+Consumer Group: jobs:browser:group (namespaced under jobs)
+Consumer Names:{hostname}:{pid}:{index} pattern for observability
+
+At-Least-Once Semantics
+
+· Use XREADGROUP with > for new messages
+· XACK only after job status updated and browser action completed (success or permanent failure)
+· Retries: Re-add messages to jobs:browser:stream with incremented attempt
+· Retry policy uses lower of Job.max_attempts and Settings.JOB_MAX_ATTEMPTS
+
+Backwards Compatibility: Phase 1 list-based queue unchanged; browser jobs specifically produced into stream
+
+2.3 OpenTelemetry Spans and Correlation IDs
+
+Correlation IDs
+
+· HTTP: CorrelationIdMiddleware sets x-request-id → correlation_id_var
+· Enqueue: API embeds correlation ID into Redis job envelope and DB (column or payload["_meta"]["correlation_id"])
+· Worker: Sets correlation_id_var from message correlation_id, falls back to DB value, then generates new UUID
+· Logs: All worker logs keep same correlation_id field
+
+Span Naming
+
+· HTTP: Keep FastAPI defaults
+· Workers: Outer span jobs.process, inner browser span jobs.browser.automation
+· Attributes: job.id, job.attempt, job.task_type, job.queue, job.correlation_id
+
+2.4 Circuit Breaker Policies
+
+Shared Library: utils.circuit_breaker.CircuitBreaker is canonical implementation
+Config Knobs:Base thresholds in Settings, worker-level overrides in WorkerSettings
+Behavior:On circuit open, reschedule with incremental attempt, log reason="circuit_open"
+Metrics:Expose circuit_state{target="playwright"} (0=closed, 1=half-open, 2=open)
+
+2.5 Feature Flags
+
+Naming: Prefix FF_ for environment-controlled flags
+Browser Worker Flags:FF_BROWSER_WORKER_ENABLED, FF_BROWSER_TASK_<TASK_NAME>_ENABLED
+Behavior:If disabled, log clear message and exit/idle; if task-type disabled, fail job with "feature_flag_disabled" reason
+
+2.6 Logging Format and Fields
+
+Structlog Configuration: Single app.logging.configure_logging() function for all components
+Common Log Fields:correlation_id, job_id (for job-related logs)
+Browser Worker Fields:job_attempt, job_task_type, job_queue="browser"
+Event Names:job_enqueued, job_automation_completed, job_automation_failed_permanently, job_automation_scheduled_retry, job_stream_message_processed
+
+2.7 Metrics Conventions
+
+Metric Names:
+
+· jobs_browser_processing_seconds (Histogram)
+· jobs_browser_errors_total{reason}
+· jobs_browser_processed_total{status}
+· jobs_browser_pending_messages
+
+HTTP Metrics: Keep prometheus-fastapi-instrumentator for API
+Worker Metrics:Expose on dedicated port with unified naming
+
+2.8 Docker and Docker Compose Labels
+
+Docker Image Labels:
+
+```dockerfile
+org.opencontainers.image.title=micro-saas-core
+org.opencontainers.image.source=${GIT_REPO}
+org.opencontainers.image.version=${VERSION}
+org.opencontainers.image.description=Core API and workers for Micro-SaaS automation
+```
+
+Compose Service Labels:
+
+```yaml
+com.micro-saas.service.role=api|worker|browser-worker
+com.micro-saas.environment=${APP_ENV}
+```
+
+Worker Container Naming: Browser worker service named browser-worker
+
+---
+
+ADR-0002: Browser Automation Worker & Cross-Cutting Conventions
+
+Status
+
+Accepted - 2024-01-16
+
+Context
+
+Phase 1 introduced a FastAPI-based backend with an async PostgreSQL layer, Redis-backed job queue, structured JSON logging, and OpenTelemetry instrumentation. A generic job worker consumed jobs from a Redis list and updated a shared jobs table.
+
+Phase 2 adds a headless browser automation worker built on Playwright and Redis Streams with at-least-once delivery semantics. The initial Phase 2 design introduced a separate configuration object, Redis key names, and partial telemetry, which risked divergence from the conventions established in Phase 1:
+
+· Different Redis key naming and queue semantics (list + sorted set vs Redis Streams)
+· Inconsistent Redis client configuration (decode_responses mismatch)
+· Incomplete correlation ID propagation from HTTP request → job enqueue → worker logs/traces
+· New circuit breaker implementation used only for Playwright
+· Ad-hoc span names and metrics naming in the worker
+· No clear feature flag keys for enabling/disabling the browser worker or specific tasks
+· No OCI/Compose labels to distinguish API vs worker roles
+
+To keep the system at Stripe/Shopify-grade maintainability and observability, we must define a single set of conventions and apply them across both phases.
+
+Decision
+
+1. Config and Naming
+
+· app.config.Settings remains the source of truth for global configuration (DB, Redis, OTEL, Sentry, and default job thresholds)
+· worker.config.WorkerSettings is limited to worker-specific tuning (stream keys, consumer group, concurrency, Playwright and circuit breaker overrides, metrics port)
+
+Redis Keys: Follow jobs:{namespace}:{type} pattern:
+
+· Generic worker: jobs:default:queue, jobs:default:scheduled, jobs:default:lock:{job_id}
+· Browser worker: jobs:browser:stream, jobs:browser:group, jobs:browser:dlq
+
+Canonical Redis Message Payload:
+
+```json
+{
+  "job_id": "uuid",
+  "attempt": 0,
+  "correlation_id": "uuid-or-upstream-id",
+  "task_type": "string",
+  "meta": {
+    "enqueue_ts": "ISO8601",
+    "...": "..."
+  }
+}
+```
+
+2. Correlation IDs and Traces
+
+· CorrelationIdMiddleware remains the single source of correlation IDs for HTTP requests via x-request-id header
+· When enqueuing a job, API embeds correlation ID into both Redis job envelope and job record
+· Workers set correlation_id_var from message correlation_id when available, falling back to stored value in DB
+· OpenTelemetry span naming:
+  · Outer span per job: jobs.process
+  · Inner browser span: jobs.browser.automation
+  · Attributes: job.id, job.attempt, job.task_type, job.queue, job.correlation_id
+
+3. Redis Streams Semantics
+
+· Browser worker uses Redis Streams with consumer group: jobs:browser:group on stream key jobs:browser:stream
+· Messages acknowledged (XACK) only after job status updated and browser action completed
+· Retries implemented by re-adding messages to stream with incremented attempt
+· Pending messages and dead-letter handling via XPENDING/XCLAIM and jobs:browser:dlq
+
+4. Circuit Breaker
+
+· Shared CircuitBreaker implementation in utils.circuit_breaker
+· Global defaults in Settings, worker-level overrides for Playwright
+· On circuit open: worker re-schedules job with incremented attempt
+· Metrics: circuit_state{target="playwright"} (0=closed, 1=half-open, 2=open)
+
+5. Feature Flags
+
+· Prefix: FF_ for environment-controlled flags
+· Browser worker flags: FF_BROWSER_WORKER_ENABLED, FF_BROWSER_TASK_<TASK_NAME>_ENABLED
+· Behavior: If disabled, log clear message and exit/idle; if task-type disabled, fail job with "feature_flag_disabled" reason
+
+6. Logging and Metrics
+
+· All components use app.logging.configure_logging() for structlog JSON logging
+· Common log fields: correlation_id, job_id injected via context variables
+· Browser worker log events: Consistent snake_case naming pattern
+· Metrics: Browser worker metrics use jobs_browser_ prefix with consistent labels
+
+7. Docker and Labels
+
+· Single Docker image hosts both API and all workers with OCI labels
+· Compose services: com.micro-saas.service.role=api|worker|browser-worker, com.micro-saas.environment=${APP_ENV}
+· Browser worker service: Named browser-worker, runs python -m worker.run
+
+Consequences
+
+Positive
+
+· Browser automation integrated without fragmenting conventions
+· Same logging style, correlation IDs, and trace structure as HTTP API and existing workers
+· Redis usage more complex but naming and message schemas uniform and self-describing
+· Circuit breaker and feature flag patterns reusable for other external dependencies
+· Operational tooling usable uniformly across all components
+
+Negative
+
+· Additional schema work required (e.g., adding job correlation ID)
+· Redis complexity increased with mixed list + streams architecture
+· Configuration management more complex with multiple settings classes
+
+Neutral
+
+· Backwards compatibility maintained for existing generic worker
+· Progressive enhancement approach for dead-letter queue and pending message handling
+
+This ADR and the decisions above are the basis for the actual Phase 2 implementation. When we write the browser worker code, it will follow these unified conventions rather than the earlier draft.

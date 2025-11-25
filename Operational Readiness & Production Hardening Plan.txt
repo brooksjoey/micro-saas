@@ -1,0 +1,408 @@
+Operational Readiness & Production Hardening Plan
+
+# Operational Readiness Plan
+
+## Recommended Order of Work
+
+If you want this to be safely "real":
+
+1. **DB schema + usage accounting logic**
+2. **JWT JWKS caching + auth hardening** 
+3. **SSE backend + tests**
+4. **Runbooks + alerts as code**
+
+**Reason**: schema and accounting define your truth; auth is your gate; SSE is UX; runbooks/alerts make it operable.
+
+## 1. Lock in DB Schema + Usage Accounting
+
+### 1.1 Tables (DDL-level)
+
+```sql
+-- users: app-side mirror of Supabase users + Stripe linkage
+CREATE TABLE users (
+  id uuid PRIMARY KEY, -- Supabase auth.uid()
+  email citext NOT NULL,
+  stripe_customer_id text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX users_email_idx ON users (email);
+
+-- subscriptions: current subscription & billing info
+CREATE TABLE subscriptions (
+  id bigserial PRIMARY KEY,
+  user_id uuid NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+  stripe_subscription_id text NOT NULL UNIQUE,
+  plan text NOT NULL, -- 'FREE' | 'PRO' | 'ENTERPRISE'
+  status text NOT NULL, -- 'active', 'past_due', 'canceled', ...
+  current_period_start timestamptz NOT NULL,
+  current_period_end timestamptz NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX subscriptions_user_id_idx ON subscriptions (user_id);
+
+-- usage_counters: aggregated per-user, per-billing-period
+CREATE TABLE usage_counters (
+  id bigserial PRIMARY KEY,
+  user_id uuid NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+  period_start timestamptz NOT NULL,
+  period_end timestamptz NOT NULL,
+  jobs_used integer NOT NULL DEFAULT 0,
+  jobs_limit integer,
+  credits_remaining integer,
+  last_reconciled_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT usage_counters_user_period_uniq UNIQUE (user_id, period_start, period_end)
+);
+
+CREATE INDEX usage_counters_user_idx ON usage_counters (user_id);
+
+-- usage_events: append-only, idempotent log
+CREATE TABLE usage_events (
+  id bigserial PRIMARY KEY,
+  user_id uuid NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+  kind text NOT NULL, -- 'job_run', 'stripe_usage', 'reconciliation', ...
+  amount integer NOT NULL, -- +1 job, -1 credit, etc.
+  job_id uuid, -- nullable
+  stripe_event_id text, -- for webhook idempotency
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+  occurred_at timestamptz NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX usage_events_user_time_idx ON usage_events (user_id, occurred_at);
+CREATE UNIQUE INDEX usage_events_stripe_event_id_idx ON usage_events (stripe_event_id)
+WHERE stripe_event_id IS NOT NULL;
+
+-- jobs: if you haven't already added correlation_id, I would
+ALTER TABLE jobs
+ADD COLUMN IF NOT EXISTS correlation_id uuid,
+ADD COLUMN IF NOT EXISTS user_id uuid REFERENCES users (id) ON DELETE SET NULL;
+
+CREATE INDEX IF NOT EXISTS jobs_user_created_at_idx ON jobs (user_id, created_at DESC);
+```
+
+1.2 Usage Accounting Rules (decide once)
+
+Unit of billing: a completed job (not a submitted one).
+
+When to increment jobs_used:
+
+· On transition PENDING/RUNNING → COMPLETED (or at least "billable success")
+
+Free vs paid:
+
+· FREE: jobs_limit = e.g. 100 jobs per billing period, credits_remaining may be NULL
+· PRO: Higher jobs_limit, plus optional credits_remaining for special operations
+· ENTERPRISE: jobs_limit = NULL (unlimited), credits_remaining may track special expensive features
+
+Stripe usage event mapping:
+
+· For each COMPLETED job, insert a usage_events row kind='job_run', amount=1
+· Either immediately report usage to Stripe or aggregate and send at reconciliation time
+
+Reconciliation loop (daily):
+
+· For each active subscription, determine current period
+· Aggregate usage_events.kind='job_run' in that period → authoritative count
+· Update usage_counters.jobs_used
+· Reconcile Stripe's reported usage vs internal jobs_used
+
+Plan enforcement hot path:
+
+· On job submission: read usage_counters (from Redis cache)
+· If jobs_limit not NULL and jobs_used >= jobs_limit:
+  · If FF_BILLING_ENFORCEMENT_ENABLED: return 402/403
+  · Else: allow job but emit warning log and metric
+
+2. SSE Backend Implementation + Tests
+
+2.1 Architecture Choices
+
+Redis Pub/Sub fan-out: Workers publish job updates to Redis channel, SSE endpoint subscribes and filters per-user.
+
+2.2 Worker-side Publishing
+
+```python
+# After updating job in DB
+event = {
+    "id": str(job.id),
+    "user_id": str(job.user_id),
+    "status": job.status,
+    "attempts": job.attempts,
+    "updated_at": job.updated_at.isoformat(),
+    "last_error": job.last_error,
+}
+await redis.publish("jobs:events", json.dumps(event))
+```
+
+2.3 SSE Endpoint
+
+```python
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
+import asyncio
+import json
+from typing import AsyncIterator
+
+from app.auth import get_current_user
+from app.redis import get_redis
+
+router = APIRouter()
+
+async def sse_event_stream(user_id: str, redis) -> AsyncIterator[bytes]:
+    pubsub = redis.pubsub()
+    await pubsub.subscribe("jobs:events")
+    try:
+        async for message in pubsub.listen():
+            if message["type"] != "message":
+                continue
+            try:
+                event = json.loads(message["data"])
+            except Exception:
+                continue
+            if event.get("user_id") != user_id:
+                continue
+            payload = json.dumps({
+                "id": event["id"],
+                "status": event["status"],
+                "attempts": event["attempts"],
+                "updated_at": event["updated_at"],
+                "last_error": event.get("last_error"),
+            })
+            yield f"data: {payload}\n\n".encode("utf-8")
+    finally:
+        await pubsub.unsubscribe("jobs:events")
+        await pubsub.close()
+
+@router.get("/jobs/stream")
+async def jobs_stream(current_user = Depends(get_current_user), redis = Depends(get_redis)):
+    async def event_generator():
+        async for chunk in sse_event_stream(str(current_user.id), redis):
+            yield chunk
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+```
+
+2.4 Tests
+
+```python
+@pytest.mark.asyncio
+async def test_sse_stream_filters_by_user(redis_client, client, auth_headers):
+    # auth_headers identifies user_id "u1"
+    async with client.stream("GET", "/api/v1/jobs/stream", headers=auth_headers) as response:
+        assert response.status_code == 200
+
+        # publish event for this user
+        event = {
+            "id": "job-1",
+            "user_id": "u1",
+            "status": "COMPLETED",
+            "attempts": 1,
+            "updated_at": "2025-01-01T00:00:00Z",
+        }
+        await redis_client.publish("jobs:events", json.dumps(event))
+
+        # read one SSE chunk
+        async for line in response.aiter_lines():
+            if line.startswith("data: "):
+                data = json.loads(line.removeprefix("data: "))
+                assert data["id"] == "job-1"
+                break
+```
+
+3. Harden JWT JWKS Caching and Error Handling
+
+3.1 Implementation
+
+```python
+# auth/jwt_validator.py
+import time
+from typing import Any, Dict
+
+import httpx
+import jwt
+from pydantic import BaseModel
+
+from app.config import get_settings
+from app.logging import get_logger
+
+log = get_logger()
+settings = get_settings()
+
+class JWKSCache(BaseModel):
+    keys: Dict[str, Dict[str, Any]] = {}
+    fetched_at: float = 0.0
+
+_jwks_cache = JWKSCache()
+_JWKS_TTL_SECONDS = 60 * 5  # 5 minutes
+
+async def _refresh_jwks_if_needed() -> None:
+    if not settings.SUPABASE_JWT_JWKS_URL:
+        return
+    now = time.time()
+    if now - _jwks_cache.fetched_at < _JWKS_TTL_SECONDS:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(settings.SUPABASE_JWT_JWKS_URL)
+            resp.raise_for_status()
+            payload = resp.json()
+            keys = {k["kid"]: k for k in payload.get("keys", [])}
+            if keys:
+                _jwks_cache.keys = keys
+                _jwks_cache.fetched_at = now
+                log.info("jwks_refreshed", key_count=len(keys))
+    except Exception as exc:
+        log.error("jwks_refresh_failed", error=str(exc))
+        # keep existing cache; do not clear it
+
+async def validate_jwt(token: str) -> Dict[str, Any]:
+    await _refresh_jwks_if_needed()
+    unverified_header = jwt.get_unverified_header(token)
+    kid = unverified_header.get("kid")
+    key_data = _jwks_cache.keys.get(kid)
+
+    if not key_data:
+        # Optionally: force a refresh once if key is missing
+        await _refresh_jwks_if_needed()
+        key_data = _jwks_cache.keys.get(kid)
+
+    if not key_data:
+        raise ValueError("Unknown key id (kid)")
+
+    public_key = jwt.algorithms.RSAAlgorithm.from_jwk(key_data)
+
+    payload = jwt.decode(
+        token,
+        key=public_key,
+        algorithms=[unverified_header.get("alg", "RS256")],
+        audience=settings.SUPABASE_JWT_AUDIENCE,
+        issuer=settings.SUPABASE_URL,
+    )
+    return payload
+```
+
+3.2 Test Coverage
+
+· Initial JWKS fetch and token validation
+· Cache hit behavior (no HTTP call on second validation)
+· Endpoint down scenario (use cached keys, log error)
+· Unknown kid handling (refresh once, then raise)
+· Expired/wrong aud/wrong iss scenarios
+
+4. Runbooks and Alerts as Code
+
+4.1 Alert Rules (Prometheus)
+
+```yaml
+groups:
+  - name: api-latency
+    rules:
+      - alert: HighAPILatencyP95
+        expr: histogram_quantile(0.95, sum(rate(http_server_request_duration_seconds_bucket[5m])) by (le)) > 0.3
+        for: 10m
+        labels:
+          severity: warning
+          service: api
+        annotations:
+          summary: "API p95 latency > 300ms"
+          description: "API latency has been above 300ms p95 for 10m."
+
+  - name: jobs
+    rules:
+      - alert: HighJobFailureRate
+        expr: |
+          sum(rate(jobs_browser_errors_total[5m])) /
+          sum(rate(jobs_browser_processed_total[5m])) > 0.05
+        for: 10m
+        labels:
+          severity: critical
+          service: browser-worker
+        annotations:
+          summary: "Job failure rate > 5%"
+          description: "Browser job error rate is above 5% over 10m."
+
+      - alert: JobBacklogGrowing
+        expr: jobs_browser_pending_messages > 1000
+        for: 15m
+        labels:
+          severity: warning
+          service: browser-worker
+        annotations:
+          summary: "Browser job backlog high"
+          description: "Pending browser jobs exceeds 1000."
+
+  - name: billing
+    rules:
+      - alert: StripeCircuitOpen
+        expr: circuit_state{target="stripe"} == 2
+        for: 5m
+        labels:
+          severity: warning
+          service: api
+        annotations:
+          summary: "Stripe circuit breaker open"
+          description: "Stripe integration circuit is open for 5m."
+
+      - alert: BillingReconciliationMissing
+        expr: time() - max(billing_reconciliation_last_success_timestamp) > 86400
+        for: 10m
+        labels:
+          severity: warning
+          service: auth-cron
+        annotations:
+          summary: "Billing reconciliation has not run in 24h"
+          description: "Daily reconciliation job appears to be stalled."
+
+  - name: auth
+    rules:
+      - alert: JWTInvalidSpike
+        expr: increase(auth_jwt_invalid_total[10m]) > 100
+        for: 10m
+        labels:
+          severity: warning
+          service: api
+        annotations:
+          summary: "JWT invalid spikes"
+          description: "High rate of invalid JWTs may indicate client misconfig or attack."
+```
+
+4.2 Runbook Skeletons
+
+runbook-stripe-circuit-open.md
+
+· Symptoms: alert fired, jobs failing with billing errors
+· Checks: logs tagged target=stripe, Stripe status page
+· Actions: temporarily disable billing features, document for later reconciliation
+
+runbook-browser-worker-backlog.md
+
+· Symptoms: JobBacklogGrowing alert
+· Checks: pending messages metrics, worker logs, Playwright environment
+· Actions: scale workers, check Playwright stability, reduce throughput if needed
+
+runbook-auth-jwks-failures.md
+
+· Symptoms: spike in invalid JWTs, JWKS refresh errors
+· Checks: JWKS endpoint health, cache validity
+· Actions: ride out with cached keys, manual intervention if keys stale
+
+runbook-reconciliation-missing.md
+
+· Symptoms: BillingReconciliationMissing alert
+· Checks: cron logs, reconciliation timestamp metric
+· Actions: restart cron, manual trigger, verify Stripe updates
+
+```

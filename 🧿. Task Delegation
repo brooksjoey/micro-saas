@@ -1,0 +1,242 @@
+🧿. Task Delegation
+
+# Founder's Task Delegation System
+
+## Executive Summary
+You're the CEO. These are your work orders for your AI engineering team. Copy-paste each prompt to a fresh AI instance to parallelize development.
+
+---
+
+## PROMPT 1: "Own my DB migrations with Alembic"
+
+**Copy-paste this to a Python/DevOps-focused AI:**
+
+You are a senior Python backend engineer and DevOps engineer.
+
+**Context:**
+I have a Python 3.11 FastAPI backend with async SQLAlchemy, PostgreSQL, Redis. It already has jobs, workers, browser worker, and Stripe/Supabase/agents wiring as previously designed. I want proper schema versioning using Alembic. I don't know how to do any of this by myself and I need exact instructions.
+
+**Your task:**
+Assume my repo root has a backend service (e.g., `app/`) that uses SQLAlchemy models and PostgreSQL. Guide me step-by-step to:
+
+a) Install and initialize Alembic in this project
+b) Wire Alembic to the same DB settings my app uses (async SQLAlchemy engine; DSN comes from env)
+c) Create a new migration that:
+   - Creates tables: `users`, `subscriptions`, `usage_counters`, `usage_events`
+   - Adds `user_id` (FK to users.id) and `correlation_id` to the existing jobs table
+   - Adds appropriate indexes and uniqueness constraints for usage and Stripe event idempotency
+d) Ensure the migration is idempotent and safe to apply on dev/staging/prod
+
+**Constraints:**
+- Treat me as an absolute beginner: for every step, show me exact shell commands, file paths, and code
+- Assume PostgreSQL 15, and that jobs already exists with at least `id/status/payload/created_at/updated_at`
+- Use `alembic/versions/<timestamp>_add_auth_billing_usage.py` for the new migration file
+- Use PostgreSQL-specific types where needed (uuid, timestamptz, citext, jsonb)
+
+**Deliverables:**
+- Complete Alembic `env.py` configuration wired to my settings
+- Full content of the new migration file
+- Short checklist: how I run migrations locally and in production
+
+---
+
+## PROMPT 2: "Wire SQLAlchemy models + usage accounting"
+
+**Copy-paste this to a SQLAlchemy/billing-focused AI:**
+
+You are a senior backend engineer specializing in SQLAlchemy and billing systems.
+
+**Context:**
+The DB now has tables: `users`, `subscriptions`, `usage_counters`, `usage_events`, and `jobs` includes `user_id` and `correlation_id`. I already use SQLAlchemy 2.0 (async) with a shared Base for models. I need models and a repository/service layer to implement a clean usage accounting system.
+
+**Business rules (decide and enforce these in code):**
+- Each COMPLETED job counts as 1 "unit" of usage
+- Usage is tracked per user and per billing period (current subscription period)
+- Plans:
+  - FREE: jobs_limit (e.g., 100 jobs per period), no credits
+  - PRO: higher jobs_limit, optional extra credit-based features later
+  - ENTERPRISE: unlimited jobs (jobs_limit = NULL), may still have credits later
+- `usage_counters` stores the aggregate; `usage_events` is an append-only log
+
+**Your task:**
+Define SQLAlchemy models for: User, Subscription, UsageCounter, UsageEvent in the existing models module. Create a UsageRepository that exposes methods like:
+- `record_job_completion(user_id, job_id, occurred_at)`
+- `get_current_usage_snapshot(user_id)`
+- `increment_usage_for_stripe_event(user_id, stripe_event_id, amount, period)`
+
+These methods must:
+- Insert usage_events rows
+- Update or create the appropriate usage_counters row for the current period
+- Be idempotent when given the same Stripe event id
+
+Integrate this with the job processing path: when a job transitions to COMPLETED, call `record_job_completion`. Show me exactly where to hook this and the snippet to add.
+
+Write pytest tests that create a user + subscription + jobs, mark jobs as COMPLETED and assert that usage_events has the expected rows and usage_counters.jobs_used is correct.
+
+**Constraints:**
+- Suggest paths like `app/models/user.py` or `app/models/billing.py`, `app/services/usage.py`
+- Show full file contents
+- Use async SQLAlchemy patterns that match async FastAPI setup
+- Explain how each new piece plugs into existing code
+
+---
+
+## PROMPT 3: "Implement plan enforcement on job creation"
+
+**Copy-paste this to a backend/API-focused AI:**
+
+You are a senior backend and API engineer.
+
+**Context:**
+The backend already has a POST `/api/v1/jobs` endpoint to create jobs, auth via Supabase JWT providing a CurrentUser, and usage tracking tables + repository from previous step. I need to enforce plan/usage limits when a user submits a job.
+
+**Business rules:**
+On each job submission:
+- Look up the user's current usage snapshot (for this billing period)
+- If jobs_limit is not NULL and jobs_used >= jobs_limit:
+  - If feature flag `FF_BILLING_ENFORCEMENT_ENABLED` is true: Reject with 402/403 error
+  - If flag is false: Allow but log warning and emit Prometheus metric
+
+**Your task:**
+Implement a `get_usage_snapshot(user_id)` dependency/service that:
+- Reads from Redis read-through cache first (30-60 second TTL)
+- On cache miss, fetches from PostgreSQL using usage repository
+
+Implement a FastAPI dependency `enforce_plan_limits(current_user, usage_snapshot)` that enforces the business rules and raises structured HTTPException on hard-deny.
+
+Wire that dependency into the POST `/api/v1/jobs` endpoint so it always runs first for authenticated job creation routes.
+
+Add Prometheus metrics: `auth_plan_denied_total{reason,plan}`
+
+Write tests for:
+- User under limit → job accepted
+- User at limit, enforcement ON → job rejected with correct HTTP code
+- User at limit, enforcement OFF → job accepted, but metric and log emitted
+
+**Constraints:**
+- Show exact code changes for dependency module and router file
+- Keep hot path fast: cache first, DB only on miss
+- Treat me as beginner with complete code examples
+
+---
+
+## PROMPT 4: "Implement Redis-backed SSE job stream"
+
+**Copy-paste this to a FastAPI/Redis-focused AI:**
+
+You are a senior FastAPI engineer with experience in SSE and Redis.
+
+**Context:**
+I have jobs table with id, user_id, status, attempts, updated_at, last_error. A Redis instance already used for job queues. A Next.js frontend that connects to GET `/api/v1/jobs/stream` via Server-Sent Events expecting JSON events. Workers currently update job status in DB but don't publish SSE events yet.
+
+**Your task:**
+On the worker side: Add function that whenever a job changes status, publishes JSON event to Redis pub/sub channel `jobs:events`. Show which worker file to modify and exact code to call after job DB update.
+
+On the backend API side: Implement GET `/api/v1/jobs/stream` endpoint in FastAPI that:
+- Requires authentication
+- Creates Redis pub/sub subscription to `jobs:events`
+- Streams only events for that user (event["user_id"] == current_user.id) using proper SSE format
+- Uses StreamingResponse with media_type="text/event-stream"
+- Cleans up pub/sub connections on disconnect
+
+Add tests:
+- Unit-test the function that filters events by user
+- Integration test with authenticated SSE connection, verifying user-scoped event delivery
+
+**Constraints:**
+- Assume Redis async client; show injection via FastAPI dependency
+- Show file paths and complete code blocks
+- Treat me as beginner with exact code
+
+---
+
+## PROMPT 5: "Supabase JWT validation with JWKS caching"
+
+**Copy-paste this to a security-focused AI:**
+
+You are a senior security-focused backend engineer.
+
+**Context:**
+I use Supabase Auth for user authentication. I receive JWTs in Authorization: Bearer <token>. I want to validate tokens using Supabase's JWKS endpoint with caching and safe behavior on failures.
+
+**Environment:**
+Python 3.11, FastAPI, Supabase config in env: SUPABASE_URL, SUPABASE_JWT_AUDIENCE, SUPABASE_JWT_JWKS_URL, optional SUPABASE_JWT_SECRET fallback.
+
+**Your task:**
+Create module `auth/jwt_validator.py` that:
+- Fetches JWKS from SUPABASE_JWT_JWKS_URL using httpx
+- Caches JWKS for configurable TTL (5 minutes)
+- Validates JWT: signature, iss == SUPABASE_URL, aud == SUPABASE_JWT_AUDIENCE, exp not expired
+- On JWKS endpoint failure: use cached keys if available, fail closed if no cache
+
+Implement auth dependency `get_current_user` that:
+- Extracts bearer token from header
+- Uses jwt_validator.validate_jwt to get claims
+- Maps claims to CurrentUser object with id from sub and email from email
+- Raises HTTPException(401) on validation error
+
+Add tests with fake JWKS server to test:
+- Initial JWKS fetch and validation
+- Behavior when JWKS endpoint fails after cache warm
+- Invalid aud, iss, expired token, unknown kid
+- Cache usage (no extra HTTP calls within TTL)
+
+**Constraints:**
+- Show full code for auth/jwt_validator.py and auth dependency module
+- Explain FastAPI wiring and env var configuration
+- Provide complete working examples
+
+---
+
+## PROMPT 6: "Runbooks + Prometheus alert rules + Grafana dashboards"
+
+**Copy-paste this to an SRE/observability-focused AI:**
+
+You are a senior SRE / observability engineer.
+
+**Context:**
+I have Prometheus scraping metrics from API, Workers, Auth/billing cron, Agents. Metrics include http_server_request_duration_seconds, jobs_browser_errors_total, jobs_browser_processed_total, auth_jwt_invalid_total, circuit_state, etc.
+
+**Your task:**
+Create Prometheus alert rules file `infra/alerts/alerts.yaml` with:
+- HighAPILatencyP95
+- HighJobFailureRate  
+- JobBacklogGrowing
+- StripeCircuitOpen
+- BillingReconciliationMissing
+- JWTInvalidSpike
+
+Each alert must have: expr, for, labels, annotations.summary + annotations.description.
+
+Create basic Grafana dashboard JSON definitions in `infra/grafana/`:
+- api-overview.json – latency, error rate, request volume
+- jobs-overview.json – job throughput, failures, backlog, browser worker latency  
+- auth-billing.json – invalid JWTs, plan denials, reconciliation status, Stripe circuit state
+
+Create runbooks in `docs/runbooks/` for:
+- runbook-stripe-circuit-open.md
+- runbook-browser-worker-backlog.md  
+- runbook-auth-jwks-failures.md
+
+Each runbook must have: Symptoms, Checks (dashboard panels and logs), Actions (mitigation steps).
+
+**Constraints:**
+- Show actual JSON structure for Grafana dashboards I can import
+- Show full content of YAML and Markdown files
+- Provide dashboard-as-code I can apply without hand-editing
+
+---
+
+## Execution Strategy
+
+**Recommended Order:**
+1. **PROMPT 1** (Database Foundation)
+2. **PROMPT 5** (Authentication) 
+3. **PROMPT 2** (Business Logic)
+4. **PROMPT 3** (API Enforcement)
+5. **PROMPT 4** (Real-time Features)
+6. **PROMPT 6** (Operations)
+
+**Pro Tip:** Start each task in a fresh chat session with the exact prompt copy-pasted. The AI will treat it as a complete specification and deliver enterprise-grade code.
+
+You're building a production SaaS platform. These prompts ensure every component meets Stripe/Shopify-level quality standards.
