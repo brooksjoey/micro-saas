@@ -1,0 +1,54 @@
+name: Load Testing
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "Test scenario to run"
+        required: true
+        default: "baseline"
+        type: choice
+        options:
+          - baseline
+          - peak
+          - sse
+          - backlog
+      environment:
+        description: "Target environment"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production
+      duration:
+        description: "Test duration (e.g., 5m, 10m)"
+        required: false
+        default: "5m"
+
+jobs:
+  loadtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up k6
+        uses: grafana/setup-k6-action@v1
+
+      - name: Run load test
+        env:
+          TARGET_URL: ${{ inputs.environment == 'production' && secrets.PROD_API_URL || secrets.STAGING_API_URL }}
+          K6_CLOUD_TOKEN: ${{ secrets.K6_CLOUD_TOKEN }}
+        run: |
+          cd infra/loadtest
+          k6 run \
+            --out cloud \
+            --env DURATION=${{ inputs.duration }} \
+            --env TARGET_URL=$TARGET_URL \
+            scripts/${{ inputs.scenario }}.js
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: loadtest-results
+          path: infra/loadtest/results/

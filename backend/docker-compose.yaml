@@ -1,0 +1,247 @@
+# Docker Compose for Micro-SaaS Platform Local Development
+# 
+# Usage:
+#   docker-compose up -d              # Start all services
+#   docker-compose up -d api postgres redis  # Start minimal set
+#   docker-compose logs -f api        # Follow API logs
+#   docker-compose exec api bash      # Shell into API container
+#
+# Environment:
+#   Copy .env.example to .env and configure before running
+
+version: "3.8"
+
+x-common-env: &common-env
+  APP_ENV: ${APP_ENV:-local}
+  POSTGRES_DSN: postgresql+asyncpg://${POSTGRES_USER:-msaas}:${POSTGRES_PASSWORD:-msaas}@postgres:5432/${POSTGRES_DB:-msaas}
+  REDIS_URL: redis://redis:6379/0
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+x-common-labels: &common-labels
+  com.micro-saas.environment: ${APP_ENV:-local}
+
+services:
+  # ==========================================================================
+  # Infrastructure Services
+  # ==========================================================================
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: msaas-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-msaas}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-msaas}
+      POSTGRES_DB: ${POSTGRES_DB:-msaas}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-msaas} -d ${POSTGRES_DB:-msaas}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    labels:
+      <<: *common-labels
+      com.micro-saas.service.role: database
+
+  redis:
+    image: redis:7-alpine
+    container_name: msaas-redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    labels:
+      <<: *common-labels
+      com.micro-saas.service.role: cache
+
+  # ==========================================================================
+  # Application Services
+  # ==========================================================================
+
+  api:
+    build:
+      context: .
+      target: api
+    container_name: msaas-api
+    environment:
+      <<: *common-env
+      SERVICE_NAME: api
+      SUPABASE_URL: ${SUPABASE_URL:-https://example.supabase.co}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
+      SUPABASE_JWT_JWKS_URL: ${SUPABASE_JWT_JWKS_URL:-}
+      SUPABASE_JWT_AUDIENCE: ${SUPABASE_JWT_AUDIENCE:-authenticated}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      SENTRY_DSN: ${SENTRY_DSN:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/metrics"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    labels:
+      <<: *common-labels
+      com.micro-saas.service.role: api
+
+  worker:
+    build:
+      context: .
+      target: worker
+    container_name: msaas-worker
+    environment:
+      <<: *common-env
+      SERVICE_NAME: worker-generic
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    labels:
+      <<: *common-labels
+      com.micro-saas.service.role: worker
+
+  browser-worker:
+    build:
+      context: .
+      target: browser-worker
+    container_name: msaas-browser-worker
+    environment:
+      <<: *common-env
+      SERVICE_NAME: worker-browser
+      FF_BROWSER_WORKER_ENABLED: "true"
+      PLAYWRIGHT_BROWSERS_PATH: /home/msaas/.cache/ms-playwright
+    depends_on:
+      redis:
+        condition: service_healthy
+    # Browser worker needs more memory for Playwright
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    labels:
+      <<: *common-labels
+      com.micro-saas.service.role: browser-worker
+
+  billing-cron:
+    build:
+      context: .
+      target: billing-cron
+    container_name: msaas-billing-cron
+    environment:
+      <<: *common-env
+      SERVICE_NAME: billing-cron
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - cron
+    labels:
+      <<: *common-labels
+      com.micro-saas.service.role: billing-cron
+
+  agents:
+    build:
+      context: .
+      target: agents
+    container_name: msaas-agents
+    environment:
+      <<: *common-env
+      SERVICE_NAME: agents
+      FF_AGENTS_ENABLED: "true"
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      CHROMA_PERSIST_DIR: /data/chroma
+    volumes:
+      - chroma_data:/data/chroma
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    profiles:
+      - agents
+    labels:
+      <<: *common-labels
+      com.micro-saas.service.role: agents
+
+  # ==========================================================================
+  # Development Tools
+  # ==========================================================================
+
+  # Run database migrations
+  migrate:
+    build:
+      context: .
+      target: api
+    container_name: msaas-migrate
+    environment:
+      <<: *common-env
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - tools
+
+  # Prometheus for local metrics
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: msaas-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ../infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    profiles:
+      - observability
+    labels:
+      <<: *common-labels
+      com.micro-saas.service.role: monitoring
+
+  # Grafana for local dashboards
+  grafana:
+    image: grafana/grafana:10.1.0
+    container_name: msaas-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ../infra/grafana:/etc/grafana/provisioning/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    profiles:
+      - observability
+    labels:
+      <<: *common-labels
+      com.micro-saas.service.role: monitoring
+
+volumes:
+  postgres_data:
+  redis_data:
+  chroma_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  default:
+    name: msaas-network

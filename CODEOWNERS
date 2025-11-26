@@ -1,0 +1,74 @@
+# CODEOWNERS - Code Ownership for Micro-SaaS Platform
+# 
+# This file defines code ownership for pull request reviews.
+# Each line is a file pattern followed by one or more owners.
+# The last matching pattern takes precedence.
+#
+# Documentation: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owner for all files (fallback)
+* @platform-team
+
+# Backend API and Services
+/backend/app/                   @backend-team
+/backend/app/routes/            @backend-team @api-reviewers
+/backend/app/services/          @backend-team
+/backend/app/models/            @backend-team @data-team
+/backend/app/auth/              @backend-team @security-team
+/backend/app/billing/           @backend-team @billing-team
+/backend/app/middleware/        @backend-team @security-team
+
+# Workers
+/backend/worker/                @backend-team @infra-team
+/backend/app/workers/           @backend-team
+
+# Agents / LLM
+/backend/agents/                @agents-team @backend-team
+
+# Database Migrations
+/backend/alembic/               @backend-team @data-team
+
+# Configuration
+/backend/app/config.py          @backend-team @infra-team
+/backend/app/telemetry/         @backend-team @observability-team
+
+# Frontend
+/frontend/                      @frontend-team
+/frontend/app/                  @frontend-team
+/frontend/components/           @frontend-team
+/frontend/hooks/                @frontend-team
+/frontend/lib/                  @frontend-team
+
+# Infrastructure
+/infra/                         @infra-team
+/infra/alerts/                  @infra-team @observability-team
+/infra/grafana/                 @infra-team @observability-team
+/infra/loadtest/                @infra-team @performance-team
+
+# Docker and Container Configuration
+/backend/Dockerfile             @infra-team @backend-team
+/backend/docker-compose.yaml    @infra-team
+/**/Dockerfile                  @infra-team
+
+# CI/CD and GitHub Configuration
+/.github/                       @infra-team @platform-team
+/.github/workflows/             @infra-team
+
+# Documentation
+/docs/                          @platform-team @docs-team
+/docs/adrs/                     @platform-team @architecture-team
+/docs/runbooks/                 @infra-team @platform-team
+/docs/records/                  @platform-team
+
+# Root Configuration Files
+/README.md                      @platform-team
+/CODEOWNERS                     @platform-team
+/.gitignore                     @platform-team
+
+# Security-sensitive files require security team review
+**/auth*                        @security-team
+**/jwt*                         @security-team
+**/billing*                     @billing-team @security-team
+**/stripe*                      @billing-team @security-team
+**/*secret*                     @security-team
+**/*credential*                 @security-team
