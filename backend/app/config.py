@@ -149,6 +149,72 @@ class Settings(BaseSettings):
         description='Queue kind identifier, default "redis_stream".',
     )
 
+    # Supabase Authentication
+    SUPABASE_URL: Optional[str] = Field(
+        default=None,
+        description="Supabase project URL, e.g. https://xxx.supabase.co",
+    )
+    SUPABASE_SERVICE_ROLE_KEY: Optional[str] = Field(
+        default=None,
+        description="Supabase service role key (server-side only, never expose to clients).",
+    )
+    SUPABASE_JWT_JWKS_URL: Optional[str] = Field(
+        default=None,
+        description="JWKS URL for Supabase JWT validation. Defaults to {SUPABASE_URL}/rest/v1/.well-known/jwks.json",
+    )
+    SUPABASE_JWT_AUDIENCE: str = Field(
+        default="authenticated",
+        description="Expected audience claim for Supabase JWTs.",
+    )
+
+    # Stripe Billing
+    STRIPE_SECRET_KEY: Optional[str] = Field(
+        default=None,
+        description="Stripe secret API key (sk_live_xxx or sk_test_xxx).",
+    )
+    STRIPE_WEBHOOK_SECRET: Optional[str] = Field(
+        default=None,
+        description="Stripe webhook signing secret (whsec_xxx).",
+    )
+    STRIPE_PUBLISHABLE_KEY: Optional[str] = Field(
+        default=None,
+        description="Stripe publishable key for frontend (pk_live_xxx or pk_test_xxx).",
+    )
+
+    # Observability
+    SENTRY_DSN: Optional[str] = Field(
+        default=None,
+        description="Sentry DSN for error tracking.",
+    )
+    OTEL_EXPORTER_OTLP_ENDPOINT: Optional[str] = Field(
+        default=None,
+        description="OpenTelemetry OTLP exporter endpoint.",
+    )
+    PROMETHEUS_ENABLED: bool = Field(
+        default=True,
+        description="Enable Prometheus metrics endpoint.",
+    )
+
+    # CORS
+    CORS_ORIGINS: str = Field(
+        default="http://localhost:3000",
+        description="Comma-separated list of allowed CORS origins.",
+    )
+
+    # Feature Flags (environment-based)
+    FF_BROWSER_WORKER_ENABLED: bool = Field(
+        default=True,
+        description="Enable browser automation worker.",
+    )
+    FF_BILLING_ENFORCEMENT_ENABLED: bool = Field(
+        default=False,
+        description="Enable plan limit enforcement (return 402/403 when over limit).",
+    )
+    FF_AGENTS_ENABLED: bool = Field(
+        default=False,
+        description="Enable LLM agent workflows.",
+    )
+
     @validator("APP_ENV")
     def _normalize_env(cls, v: str) -> str:
         """
@@ -203,6 +269,27 @@ class Settings(BaseSettings):
         Compute the canonical Redis key prefix, e.g. "msaas:dev:".
         """
         return f"{self.MSAAS_REDIS_PREFIX}:{self.env_label}:"
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        """
+        Parse CORS_ORIGINS as a list of origins.
+        """
+        if not self.CORS_ORIGINS:
+            return []
+        return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
+
+    @property
+    def supabase_jwks_url(self) -> Optional[str]:
+        """
+        Get the JWKS URL, deriving from SUPABASE_URL if not explicitly set.
+        """
+        if self.SUPABASE_JWT_JWKS_URL:
+            return self.SUPABASE_JWT_JWKS_URL
+        if self.SUPABASE_URL:
+            base_url = self.SUPABASE_URL.rstrip("/")
+            return f"{base_url}/rest/v1/.well-known/jwks.json"
+        return None
 
     def describe(self) -> dict[str, Any]:
         """
