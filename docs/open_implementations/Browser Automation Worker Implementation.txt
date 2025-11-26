@@ -1,1 +1,249 @@
+Browser Automation Worker Implementation
 
+# Browser Automation Worker Implementation
+
+## File Structure
+```
+
+worker/
+├──init.py
+├──config.py
+├──engine.py
+├──run.py
+├──actions/
+│├── init.py
+│├── base.py
+│└── navigation.py
+└──utils/
+├── init.py
+├── circuit_breaker.py
+└── playwright_context.py
+
+```
+
+## Core Components
+
+### Worker Configuration
+```python
+# worker/config.py
+from functools import lru_cache
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
+
+class WorkerSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", case_sensitive=True)
+
+    WORKER_NAME: str = "browser-automation-worker"
+    
+    # Redis Streams
+    JOB_STREAM_KEY: str = Field(default="jobs:stream:browser", min_length=3)
+    JOB_CONSUMER_GROUP: str = Field(default="browser-workers", min_length=3)
+    JOB_STREAM_BATCH_SIZE: int = Field(default=10, ge=1, le=100)
+    WORKER_CONCURRENCY: int = Field(default=4, ge=1, le=64)
+    
+    # Playwright
+    PLAYWRIGHT_PERSISTENT_DIR: str = "/tmp/playwright-profile"
+    PLAYWRIGHT_HEADLESS: bool = True
+    PLAYWRIGHT_NAVIGATION_TIMEOUT_MS: int = Field(default=10_000, ge=1_000)
+    PLAYWRIGHT_ACTION_TIMEOUT_MS: int = Field(default=5_000, ge=500)
+    
+    # Circuit breaker around Playwright
+    CIRCUIT_BREAKER_FAILURE_THRESHOLD: int = Field(default=5, ge=1)
+    CIRCUIT_BREAKER_RESET_TIMEOUT_SECONDS: int = Field(default=60, ge=5)
+    
+    # Job behavior
+    JOB_MAX_ATTEMPTS: int = Field(default=5, ge=1, le=20)
+    
+    # Metrics (Prometheus)
+    METRICS_PORT: int = Field(default=9001, ge=1024, le=65535)
+    ENABLE_METRICS: bool = True
+
+@lru_cache
+def get_worker_settings() -> WorkerSettings:
+    return WorkerSettings()
+```
+
+Action Framework
+
+```python
+# actions/base.py
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from time import perf_counter
+from typing import Any, ClassVar, Dict, Mapping, Type
+
+from pydantic import BaseModel, ConfigDict, HttpUrl
+from playwright.async_api import Page
+
+class ActionParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    
+    url: HttpUrl | str
+    navigation_timeout_ms: int | None = None
+    action_timeout_ms: int | None = None
+
+@dataclass
+class ActionResult:
+    success: bool
+    duration_ms: float
+    data: Dict[str, Any] | None = None
+    error: str | None = None
+
+class Action(ABC):
+    name: ClassVar[str]
+    
+    @abstractmethod
+    async def run(self, page: Page, params: ActionParams) -> ActionResult:
+        ...
+
+# Action registry for dynamic task routing
+_ACTION_REGISTRY: Dict[str, Type[Action]] = {}
+
+def register_action(action_cls: Type[Action]) -> None:
+    key = action_cls.name
+    _ACTION_REGISTRY[key] = action_cls
+
+def get_action_for_task(task_type: str) -> Type[Action]:
+    return _ACTION_REGISTRY[task_type]
+```
+
+Navigation Action Implementation
+
+```python
+# actions/navigation.py
+class NavigateAndExtractTextAction(Action):
+    name = "navigate_and_extract_text"
+
+    async def run(self, page: Page, params: NavigateAndExtractParams) -> ActionResult:
+        navigation_timeout_ms = params.navigation_timeout_ms or 10_000
+        action_timeout_ms = params.action_timeout_ms or 5_000
+
+        try:
+            await page.goto(str(params.url), wait_until="domcontentloaded", timeout=navigation_timeout_ms)
+        except PlaywrightTimeoutError as exc:
+            raise RuntimeError(f"navigation_timeout: {exc}") from exc
+
+        try:
+            await page.wait_for_selector(params.wait_for_selector, timeout=action_timeout_ms)
+        except PlaywrightTimeoutError as exc:
+            raise RuntimeError(f"dom_missing_or_timeout: {exc}") from exc
+
+        extracted: Dict[str, Any] = {}
+        if params.extract_text_selector:
+            element = await page.query_selector(params.extract_text_selector)
+            if element is None:
+                raise RuntimeError("extractor_selector_not_found")
+            text = await element.text_content()
+            extracted["text"] = text
+
+        return ActionResult(success=True, duration_ms=0.0, data=extracted, error=None)
+```
+
+Circuit Breaker Pattern
+
+```python
+# utils/circuit_breaker.py
+class CircuitState(str, Enum):
+    CLOSED = "CLOSED"
+    OPEN = "OPEN"
+    HALF_OPEN = "HALF_OPEN"
+
+@dataclass
+class CircuitBreaker:
+    failure_threshold: int
+    reset_timeout_seconds: int
+
+    state: CircuitState = CircuitState.CLOSED
+    failure_count: int = 0
+    opened_at: float | None = None
+
+    async def call(self, func: Callable[[], Awaitable[T]]) -> T:
+        now = time.time()
+
+        if self.state == CircuitState.OPEN:
+            if now - self.opened_at < self.reset_timeout_seconds:
+                raise CircuitOpenError("circuit_open")
+            self.state = CircuitState.HALF_OPEN
+
+        try:
+            result = await func()
+        except Exception:
+            self._record_failure(now)
+            raise
+
+        self._record_success()
+        return result
+```
+
+Playwright Context Management
+
+```python
+# utils/playwright_context.py
+class PlaywrightManager:
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._playwright = None
+        self._context: Optional[BrowserContext] = None
+
+    async def start(self) -> None:
+        async with self._lock:
+            if self._context is not None:
+                return
+
+            self._playwright = await async_playwright().start()
+            self._context = await self._playwright.chromium.launch_persistent_context(
+                user_data_dir=_settings.PLAYWRIGHT_PERSISTENT_DIR,
+                headless=_settings.PLAYWRIGHT_HEADLESS,
+                viewport={"width": 1280, "height": 720},
+                args=[
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--no-sandbox",
+                    "--disable-extensions",
+                ],
+            )
+```
+
+Stream Processing Engine
+
+```python
+# worker/engine.py
+async def worker_loop(redis: aioredis.Redis, consumer_name: str) -> None:
+    circuit_breaker = CircuitBreaker(
+        failure_threshold=worker_settings.CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+        reset_timeout_seconds=worker_settings.CIRCUIT_BREAKER_RESET_TIMEOUT_SECONDS,
+    )
+
+    while True:
+        streams = await redis.xreadgroup(
+            groupname=worker_settings.JOB_CONSUMER_GROUP,
+            consumername=consumer_name,
+            streams={worker_settings.JOB_STREAM_KEY: ">"},
+            count=worker_settings.JOB_STREAM_BATCH_SIZE,
+            block=5000,
+        )
+
+        if not streams:
+            continue
+
+        for _, messages in streams:
+            for raw_id, raw_fields in messages:
+                message = _parse_stream_message(raw_id, raw_fields)
+                await process_single_message(redis, message, circuit_breaker)
+```
+
+Key Features
+
+· Redis Streams: At-least-once job delivery with consumer groups
+· Circuit Breaker: Protects against cascading Playwright failures
+· Action Framework: Extensible system for different browser automation tasks
+· Metrics: Prometheus integration for monitoring
+· Retry Logic: Configurable retry attempts with exponential backoff
+· Persistent Context: Reusable browser sessions for performance
+· Async Processing: High concurrency with configurable worker limits
+
+Usage
+
+The worker processes jobs from Redis Streams, executes browser automation tasks via Playwright, and manages job state with circuit breaker protection for resilience.
+
+```
