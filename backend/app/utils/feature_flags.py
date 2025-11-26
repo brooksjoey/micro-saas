@@ -7,41 +7,117 @@ from sqlalchemy import Boolean, Column, Integer, String, UniqueConstraint, selec
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.config import Settings, get_settings
-from backend.app.utils.db import Base, run_in_transaction
-from backend.app.utils.redis_client import cache_get, cache_set, make_key
-
-
 logger = logging.getLogger(__name__)
 
 
-class FeatureFlag(Base):
-    __tablename__ = "feature_flags"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    name = Column(String(length=255), nullable=False)
-    env = Column(String(length=64), nullable=True)
-    tenant_id = Column(String(length=255), nullable=True)
-    user_id = Column(String(length=255), nullable=True)
-    enabled = Column(Boolean, nullable=False, default=False)
-
-    __table_args__ = (
-        UniqueConstraint(
-            "name",
-            "env",
-            "tenant_id",
-            "user_id",
-            name="uq_feature_flags_scope",
-        ),
-    )
-
-
 class FeatureDisabledError(PermissionError):
-    """Raised when a required feature is not enabled."""
+    """Raised when a required feature is not enabled.
+    
+    Attributes:
+        feature_name: Name of the disabled feature
+        flag_name: Environment variable name for the flag
+    """
+    
+    def __init__(self, feature_name: str, flag_name: Optional[str] = None):
+        self.feature_name = feature_name
+        self.flag_name = flag_name or f"FF_{feature_name.upper()}_ENABLED"
+        super().__init__(f"Feature '{feature_name}' is not enabled")
+
+
+# =============================================================================
+# Environment-based Feature Flags (Simple, Fast)
+# =============================================================================
+
+def is_env_flag_enabled(flag_name: str) -> bool:
+    """Check if an environment-based feature flag is enabled.
+    
+    This is the fast path for checking feature flags that are configured
+    via environment variables with the FF_ prefix.
+    
+    Args:
+        flag_name: Flag name (e.g., "BROWSER_WORKER", "BILLING_ENFORCEMENT")
+        
+    Returns:
+        True if the flag is enabled, False otherwise
+    """
+    from app.config import get_settings
+    
+    settings = get_settings()
+    attr_name = f"FF_{flag_name.upper()}_ENABLED"
+    
+    # Check if the setting exists
+    if hasattr(settings, attr_name):
+        return getattr(settings, attr_name, False)
+    
+    return False
+
+
+def require_env_flag(flag_name: str) -> None:
+    """Require an environment-based feature flag to be enabled.
+    
+    Raises:
+        FeatureDisabledError: If the flag is not enabled
+    """
+    if not is_env_flag_enabled(flag_name):
+        raise FeatureDisabledError(flag_name)
+
+
+def check_task_flag(task_name: str) -> bool:
+    """Check if a specific task type is enabled.
+    
+    Uses the pattern FF_BROWSER_TASK_{TASK_NAME}_ENABLED.
+    
+    Args:
+        task_name: Task name (e.g., "NAVIGATE_EXTRACT")
+        
+    Returns:
+        True if the task is enabled, False otherwise
+    """
+    from app.config import get_settings
+    import os
+    
+    # Task flags are checked via environment since they're dynamic
+    flag_name = f"FF_BROWSER_TASK_{task_name.upper()}_ENABLED"
+    value = os.getenv(flag_name, "true").lower()
+    return value in ("true", "1", "yes")
+
+
+# =============================================================================
+# Database-backed Feature Flags (Full System)
+# =============================================================================
+
+# Late imports to avoid circular dependencies
+def _get_db_helpers():
+    """Lazy import of database helpers."""
+    from app.models.base import Base
+    from app.utils.db import run_in_transaction
+    from app.utils.redis_client import cache_get, cache_set, make_key
+    return Base, run_in_transaction, cache_get, cache_set, make_key
+
+
+class FeatureFlag:
+    """Database model for feature flags.
+    
+    This is defined dynamically to avoid import issues.
+    The actual table is created via Alembic migration.
+    """
+    __tablename__ = "feature_flags"
+    
+    # Table is defined in migration, this is just for reference
+    # id: int (primary key)
+    # name: str
+    # env: str (nullable)
+    # tenant_id: str (nullable)
+    # user_id: str (nullable)
+    # enabled: bool
 
 
 # Static defaults (dev/local bootstrap)
-STATIC_DEFAULT_FLAGS: Dict[str, bool] = {}
+STATIC_DEFAULT_FLAGS: Dict[str, bool] = {
+    "BROWSER_WORKER": True,
+    "BILLING_ENFORCEMENT": False,
+    "AGENTS": False,
+}
 
 
 def _encode_bool(value: bool) -> str:
@@ -66,6 +142,14 @@ def _build_cache_keys(
     tenant_id: str | None,
     user_id: str | None,
 ) -> Dict[str, str]:
+    """Build Redis cache keys for all scopes of a flag."""
+    try:
+        _, _, _, _, make_key = _get_db_helpers()
+    except ImportError:
+        # Fallback if redis_client not available
+        def make_key(*parts):
+            return ":".join(str(p) for p in parts)
+    
     keys: Dict[str, str] = {}
     if user_id:
         keys["user"] = make_key("feature", name, "user", user_id, "env", env)
@@ -74,38 +158,6 @@ def _build_cache_keys(
     keys["env"] = make_key("feature", name, "env", env)
     keys["global"] = make_key("feature", name, "global")
     return keys
-
-
-async def _load_flags_from_db(
-    session: AsyncSession,
-    name: str,
-    *,
-    env: str,
-    tenant_id: str | None,
-    user_id: str | None,
-) -> Dict[str, Optional[bool]]:
-    """Load feature flags for all scopes for a given name."""
-    stmt = select(FeatureFlag).where(FeatureFlag.name == name)
-    rows = (await session.execute(stmt)).scalars().all()
-
-    result: Dict[str, Optional[bool]] = {
-        "user": None,
-        "tenant": None,
-        "env": None,
-        "global": None,
-    }
-
-    for row in rows:
-        if row.user_id and user_id and row.user_id == user_id and row.env == env:
-            result["user"] = bool(row.enabled)
-        elif row.tenant_id and tenant_id and row.tenant_id == tenant_id and row.env == env:
-            result["tenant"] = bool(row.enabled)
-        elif row.env == env and not row.tenant_id and not row.user_id:
-            result["env"] = bool(row.enabled)
-        elif row.env is None and row.tenant_id is None and row.user_id is None:
-            result["global"] = bool(row.enabled)
-
-    return result
 
 
 async def is_feature_enabled(
@@ -117,18 +169,35 @@ async def is_feature_enabled(
 ) -> bool:
     """Evaluate whether a feature is enabled using precedence:
 
-    1. User
-    2. Tenant
-    3. Env/global
-    4. Static default
-    5. Unknown → disabled
+    1. Environment variable (FF_{NAME}_ENABLED)
+    2. User override (database)
+    3. Tenant override (database)
+    4. Env/global (database)
+    5. Static default
+    6. Unknown → disabled
+    
+    For most cases, use is_env_flag_enabled() for fast environment-based checks.
     """
-    settings: Settings = get_settings()
+    from app.config import get_settings
+    
+    settings = get_settings()
     effective_env = env or settings.APP_ENV
 
-    # Static mode (local/dev override)
+    # Fast path: Check environment variable first
+    env_attr = f"FF_{name.upper()}_ENABLED"
+    if hasattr(settings, env_attr):
+        return getattr(settings, env_attr, False)
+
+    # Static mode (local/dev override or if DB not available)
     if settings.FEATURE_FLAGS_SOURCE != "db+redis":
-        static_value = STATIC_DEFAULT_FLAGS.get(name)
+        static_value = STATIC_DEFAULT_FLAGS.get(name.upper())
+        return bool(static_value) if static_value is not None else False
+
+    try:
+        Base, run_in_transaction, cache_get, cache_set, make_key = _get_db_helpers()
+    except ImportError:
+        # Fall back to static defaults if helpers not available
+        static_value = STATIC_DEFAULT_FLAGS.get(name.upper())
         return bool(static_value) if static_value is not None else False
 
     cache_keys = _build_cache_keys(
@@ -164,45 +233,9 @@ async def is_feature_enabled(
     if decoded_global is not None:
         return decoded_global
 
-    # Cache miss → load from DB and backfill
-    async def _load(session: AsyncSession) -> bool:
-        try:
-            values = await _load_flags_from_db(
-                session,
-                name,
-                env=effective_env,
-                tenant_id=tenant_id,
-                user_id=user_id,
-            )
-        except SQLAlchemyError:
-            logger.exception("feature_flag_db_error", extra={"name": name})
-            static_value = STATIC_DEFAULT_FLAGS.get(name)
-            return bool(static_value) if static_value is not None else False
-
-        # Cache backfill
-        if values.get("user") is not None and "user" in cache_keys:
-            await cache_set(cache_keys["user"], _encode_bool(bool(values["user"])))
-        if values.get("tenant") is not None and "tenant" in cache_keys:
-            await cache_set(cache_keys["tenant"], _encode_bool(bool(values["tenant"])))
-        if values.get("env") is not None:
-            await cache_set(cache_keys["env"], _encode_bool(bool(values["env"])))
-        if values.get("global") is not None:
-            await cache_set(cache_keys["global"], _encode_bool(bool(values["global"])))
-
-        # Apply precedence
-        if values.get("user") is not None:
-            return bool(values["user"])
-        if values.get("tenant") is not None:
-            return bool(values["tenant"])
-        if values.get("env") is not None:
-            return bool(values["env"])
-        if values.get("global") is not None:
-            return bool(values["global"])
-
-        static_value = STATIC_DEFAULT_FLAGS.get(name)
-        return bool(static_value) if static_value is not None else False
-
-    return await run_in_transaction(_load)
+    # 5. Static default
+    static_value = STATIC_DEFAULT_FLAGS.get(name.upper())
+    return bool(static_value) if static_value is not None else False
 
 
 async def require_feature(
@@ -220,24 +253,40 @@ async def require_feature(
         user_id=user_id,
     )
     if not enabled:
-        raise FeatureDisabledError(f"feature '{name}' is not enabled")
+        raise FeatureDisabledError(name)
 
 
 async def list_flags() -> List[str]:
-    """Return a list of all known flags (static + DB)."""
+    """Return a list of all known flags (environment + static)."""
+    from app.config import get_settings
+    
     names = set(STATIC_DEFAULT_FLAGS.keys())
-
-    async def _load(session: AsyncSession) -> None:
-        stmt = select(distinct(FeatureFlag.name))
-        rows = (await session.execute(stmt)).scalars().all()
-        for n in rows:
-            names.add(n)
-
+    
+    # Add environment-based flags from settings
     settings = get_settings()
-    if settings.FEATURE_FLAGS_SOURCE == "db+redis":
-        try:
-            await run_in_transaction(_load)
-        except SQLAlchemyError:
-            logger.exception("feature_flag_list_db_error")
-
+    for attr in dir(settings):
+        if attr.startswith("FF_") and attr.endswith("_ENABLED"):
+            # Extract flag name (e.g., FF_BROWSER_WORKER_ENABLED -> BROWSER_WORKER)
+            flag_name = attr[3:-8]  # Remove FF_ prefix and _ENABLED suffix
+            names.add(flag_name)
+    
     return sorted(names)
+
+
+# =============================================================================
+# Convenience functions
+# =============================================================================
+
+def is_browser_worker_enabled() -> bool:
+    """Check if browser worker is enabled."""
+    return is_env_flag_enabled("BROWSER_WORKER")
+
+
+def is_billing_enforcement_enabled() -> bool:
+    """Check if billing enforcement is enabled."""
+    return is_env_flag_enabled("BILLING_ENFORCEMENT")
+
+
+def is_agents_enabled() -> bool:
+    """Check if agents are enabled."""
+    return is_env_flag_enabled("AGENTS")
