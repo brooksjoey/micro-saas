@@ -53,17 +53,10 @@ def _get_supabase_config() -> tuple[Optional[str], Optional[str], Optional[str]]
         from app.config import get_settings
         settings = get_settings()
         
-        # Build JWKS URL from Supabase URL if not explicitly set
-        supabase_url = getattr(settings, "SUPABASE_URL", None)
-        jwks_url = getattr(settings, "SUPABASE_JWT_JWKS_URL", None)
-        
-        if not jwks_url and supabase_url:
-            # Standard Supabase JWKS endpoint
-            base_url = str(supabase_url).rstrip("/")
-            jwks_url = f"{base_url}/rest/v1/.well-known/jwks.json"
-        
-        issuer = supabase_url
-        audience = getattr(settings, "SUPABASE_JWT_AUDIENCE", "authenticated")
+        # Use centralized JWKS URL property
+        jwks_url = settings.supabase_jwks_url
+        issuer = settings.SUPABASE_URL
+        audience = settings.SUPABASE_JWT_AUDIENCE
         
         return jwks_url, issuer, audience
         

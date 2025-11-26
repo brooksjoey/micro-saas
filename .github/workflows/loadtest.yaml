@@ -26,6 +26,10 @@ on:
         required: false
         default: "5m"
 
+# Restrict GITHUB_TOKEN permissions for security
+permissions:
+  contents: read
+
 jobs:
   loadtest:
     runs-on: ubuntu-latest
